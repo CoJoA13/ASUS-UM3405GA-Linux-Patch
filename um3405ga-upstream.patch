@@ -1,0 +1,35 @@
+From f61bc797ac0075dbaac5e44238674858e9dbe399 Mon Sep 17 00:00:00 2001
+From: Colton Jones <cjones1308@pm.me>
+Date: Mon, 15 Jun 2026 03:36:20 +0000
+Subject: [PATCH] ALSA: hda/realtek: Add CS35L41 I2C quirk for ASUS UM3405GA
+
+The ASUS Zenbook 14 UM3405GA uses a Realtek ALC294 codec with two
+Cirrus Logic CS35L41 speaker amplifiers exposed through the CSC3551 ACPI
+device. The machine reports the Realtek subsystem ID 1043:19f4.
+
+Without a PCI quirk, the codec falls back to generic pin matching and the
+internal speakers remain silent even though PCM playback completes.
+
+Add the UM3405GA subsystem ID and reuse the same ASUS I2C headset-mic
+fixup used by the closely related UM3406HA. That fixup configures the
+headset microphone pin and chains to CS35L41 I2C speaker-amp binding.
+
+Signed-off-by: Colton Jones <cjones1308@pm.me>
+Link: https://patch.msgid.link/20260615033619.7-1-cjones1308@pm.me
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ sound/hda/codecs/realtek/alc269.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/sound/hda/codecs/realtek/alc269.c b/sound/hda/codecs/realtek/alc269.c
+index f86d5754abd645..6a706c8d9c5764 100644
+--- a/sound/hda/codecs/realtek/alc269.c
++++ b/sound/hda/codecs/realtek/alc269.c
+@@ -7411,6 +7411,7 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x1043, 0x1982, "ASUS B1400CEPE", ALC256_FIXUP_ASUS_HPE),
+ 	SND_PCI_QUIRK(0x1043, 0x19ce, "ASUS B9450FA", ALC294_FIXUP_ASUS_HPE),
+ 	SND_PCI_QUIRK(0x1043, 0x19e1, "ASUS UX581LV", ALC295_FIXUP_ASUS_MIC_NO_PRESENCE),
++	SND_PCI_QUIRK(0x1043, 0x19f4, "ASUS UM3405GA", ALC294_FIXUP_ASUS_I2C_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1043, 0x1a13, "Asus G73Jw", ALC269_FIXUP_ASUS_G73JW),
+ 	SND_PCI_QUIRK(0x1043, 0x1a63, "ASUS UX3405MA", ALC294_FIXUP_ASUS_SPI_HEADSET_MIC),
+ 	SND_PCI_QUIRK(0x1043, 0x1a83, "ASUS UM5302LA", ALC294_FIXUP_CS35L41_I2C_2),
