@@ -1,71 +1,42 @@
 # UM3405GA Sound Patch
 
-This machine is an ASUS Zenbook 14 UM3405GA with Realtek ALC294 audio and
-Cirrus CS35L41 speaker amps exposed through `CSC3551`.
+This repository collects temporary Linux audio fixes for the ASUS Zenbook 14
+UM3405GA. The laptop uses a Realtek ALC294 codec with two Cirrus CS35L41 speaker
+amps exposed through `CSC3551`.
 
 The upstream kernel fix is commit `f61bc797ac0075dbaac5e44238674858e9dbe399`:
 
 > ALSA: hda/realtek: Add CS35L41 I2C quirk for ASUS UM3405GA
 
-The installed Ubuntu `7.0.0-22-generic` kernel predates that commit. The local
-workaround in `patch-um3405ga-sound.sh` patches installed
-`snd-hda-codec-alc269.ko.zst` modules by replacing the existing UM3406HA quirk
-ID `1043:1c03` with the UM3405GA quirk ID `1043:19f4`; both use
-`ALC294_FIXUP_ASUS_I2C_HEADSET_MIC`.
+That patch is kept at [patches/um3405ga-upstream.patch](patches/um3405ga-upstream.patch).
+Once your distro ships a kernel containing that commit, the binary module
+hotfix is no longer needed.
 
-The patch changes module contents, so it strips the stale appended module
-signature before recompressing. This requires Secure Boot/module-signature
-enforcement to be disabled until an official kernel containing the upstream
-commit is installed.
+## Layout
 
-It also installs `/etc/modprobe.d/um3405ga-sound.conf` so
-`snd_hda_codec_alc269` registers before `snd_hda_intel` probes the codec. This
-prevents `snd_hda_codec_generic` from claiming the Realtek ALC294 first.
+- [bazzite/](bazzite/) builds local RPMs for rpm-ostree systems.
+- [ubuntu/](ubuntu/) keeps the original mutable Ubuntu workaround.
+- [shared/](shared/) contains helpers used by more than one distro path.
+- [docs/bazzite-rpm-ostree.md](docs/bazzite-rpm-ostree.md) has the Bazzite
+  build, install, verify, update, and rollback instructions.
+- [docs/ubuntu.md](docs/ubuntu.md) has the Ubuntu instructions.
 
-If the generic driver still wins at boot, the installer also enables
-`um3405ga-sound-rebind.service`, which unbinds `hdaudioC1D0` from generic and
-binds it to `snd_hda_codec_alc269` after the HDA device exists.
+## Recommended Path
 
-Run:
+For Bazzite, start with the rpm-ostree packaging path:
 
 ```bash
-sudo ./patch-um3405ga-sound.sh
+./bazzite/build-support-rpm.sh
+./bazzite/build-cs35l41-tuning-rpm.sh
+./bazzite/build-module-hotfix-rpm.sh
+```
+
+If the module builder says the kernel already contains the UM3405GA quirk, skip
+the module hotfix RPM and install only the support and tuning RPMs.
+
+For Ubuntu, use:
+
+```bash
+sudo ./ubuntu/patch-um3405ga-sound.sh
 sudo reboot
-```
-
-After reboot:
-
-```bash
-journalctl -k -b | grep -Ei 'UM3405|cs35l41|CSC3551|ALC294'
-readlink -f /sys/bus/hdaudio/devices/hdaudioC1D0/driver
-systemctl status um3405ga-sound-rebind.service --no-pager
-sudo modprobe snd_hda_codec_alc269
-speaker-test -Dhw:1,0 -c2 -t wav
-```
-
-For a live rebind test without rebooting:
-
-```bash
-sudo ./rebind-um3405ga-sound.sh
-```
-
-## CS35L41 speaker tuning
-
-If the speakers work but are quiet, the amps may still be using the generic
-fallback coefficients. The helper below creates the UM3405GA firmware names
-requested by the driver (`104319f4-spkid1`): it aliases the generic CS35L41
-WMFW file and copies the closely related UM3406HA CS35L41 coefficient files
-(`10431c03-spkid0`). It then tries to reload the DSP firmware:
-
-```bash
-sudo ./install-um3405ga-cs35l41-tuning.sh install
-```
-
-If the live reload does not complete, reboot before testing volume. Start at a
-low volume after installing borrowed speaker tuning.
-
-To go back to the generic fallback tuning:
-
-```bash
-sudo ./install-um3405ga-cs35l41-tuning.sh restore
 ```

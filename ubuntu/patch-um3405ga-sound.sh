@@ -8,12 +8,14 @@ set -euo pipefail
 # ASUS UM3406HA 1043:1c03 entry. For installed binary modules, replace that
 # one subsystem ID in snd-hda-codec-alc269.ko.zst and rebuild module metadata.
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "${script_dir}/.." && pwd)
 old_id=$'\x43\x10\x03\x1c' # 1043:1c03, ASUS UM3406HA
 new_id=$'\x43\x10\xf4\x19' # 1043:19f4, ASUS UM3405GA
 module_relpath='kernel/sound/hda/codecs/realtek/snd-hda-codec-alc269.ko.zst'
 modprobe_conf='/etc/modprobe.d/um3405ga-sound.conf'
 softdep_line='softdep snd_hda_intel pre: snd_hda_codec_alc269 snd_hda_scodec_cs35l41_i2c'
-rebind_src='./rebind-um3405ga-sound.sh'
+rebind_src="${repo_root}/shared/rebind-um3405ga-sound.sh"
 rebind_dst='/usr/local/sbin/um3405ga-sound-rebind'
 service_file='/etc/systemd/system/um3405ga-sound-rebind.service'
 
