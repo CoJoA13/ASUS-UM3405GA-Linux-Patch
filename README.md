@@ -7,40 +7,47 @@ The upstream kernel fix is commit `f61bc797ac0075dbaac5e44238674858e9dbe399`:
 
 > ALSA: hda/realtek: Add CS35L41 I2C quirk for ASUS UM3405GA
 
-The installed Ubuntu `7.0.0-22-generic` kernel predates that commit. The local
-workaround in `patch-um3405ga-sound.sh` patches installed
-`snd-hda-codec-alc269.ko.zst` modules by replacing the existing UM3406HA quirk
-ID `1043:1c03` with the UM3405GA quirk ID `1043:19f4`; both use
-`ALC294_FIXUP_ASUS_I2C_HEADSET_MIC`.
-
-The patch changes module contents, so it strips the stale appended module
-signature before recompressing. This requires Secure Boot/module-signature
-enforcement to be disabled until an official kernel containing the upstream
-commit is installed.
-
-It also installs `/etc/modprobe.d/um3405ga-sound.conf` so
-`snd_hda_codec_alc269` registers before `snd_hda_intel` probes the codec. This
-prevents `snd_hda_codec_generic` from claiming the Realtek ALC294 first.
-
-If the generic driver still wins at boot, the installer also enables
-`um3405ga-sound-rebind.service`, which unbinds `hdaudioC1D0` from generic and
-binds it to `snd_hda_codec_alc269` after the HDA device exists.
-
-Run:
+Linux `7.1.2` is the target supported path for this repository. Use the Ubuntu
+Mainline Kernel build instead of patching installed Ubuntu kernel modules:
 
 ```bash
-sudo ./patch-um3405ga-sound.sh
+sudo ./install-ubuntu-mainline-kernel.sh 7.1.2
 sudo reboot
 ```
 
 After reboot:
 
 ```bash
-journalctl -k -b | grep -Ei 'UM3405|cs35l41|CSC3551|ALC294'
+uname -r
+journalctl -k -b --no-pager | grep -Ei 'UM3405|cs35l41|CSC3551|ALC294|snd_hda_codec_alc269'
 readlink -f /sys/bus/hdaudio/devices/hdaudioC1D0/driver
-systemctl status um3405ga-sound-rebind.service --no-pager
-sudo modprobe snd_hda_codec_alc269
 speaker-test -Dhw:1,0 -c2 -t wav
+```
+
+The legacy local workaround in `patch-um3405ga-sound.sh` remains for older
+kernels that predate the upstream commit. It patches installed
+`snd-hda-codec-alc269.ko.zst` modules by replacing the existing UM3406HA quirk
+ID `1043:1c03` with the UM3405GA quirk ID `1043:19f4`; both use
+`ALC294_FIXUP_ASUS_I2C_HEADSET_MIC`.
+
+The legacy patch changes module contents, so it strips the stale appended
+module signature before recompressing. This requires Secure Boot/module-
+signature enforcement to be disabled until an official kernel containing the
+upstream commit is installed.
+
+It also installs `/etc/modprobe.d/um3405ga-sound.conf` so
+`snd_hda_codec_alc269` registers before `snd_hda_intel` probes the codec. This
+prevents `snd_hda_codec_generic` from claiming the Realtek ALC294 first.
+
+If the generic driver still wins at boot, the legacy installer also enables
+`um3405ga-sound-rebind.service`, which unbinds `hdaudioC1D0` from generic and
+binds it to `snd_hda_codec_alc269` after the HDA device exists.
+
+For the legacy workaround, run:
+
+```bash
+sudo ./patch-um3405ga-sound.sh
+sudo reboot
 ```
 
 For a live rebind test without rebooting:
