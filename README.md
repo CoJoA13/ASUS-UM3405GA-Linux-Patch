@@ -14,7 +14,7 @@ The quirk landed in the **Linux 7.2 merge window**: it is in `v7.2-rc1` and
 newer, and it is **not** in any `7.1.x` stable release. A `7.1.x` kernel still
 needs the legacy module patch below.
 
-Start by asking the machine what it has:
+Start by asking the machine what it has. From a terminal:
 
 ```bash
 ./check-um3405ga-sound.sh
@@ -23,6 +23,12 @@ Start by asking the machine what it has:
 That reports the running kernel, whether its Realtek quirk table actually
 contains `1043:19f4`, which driver claimed the codec, what the CS35L41 amps
 bound as, and which tuning files are installed.
+
+Every run also writes the same report to `um3405ga-sound-report.txt` (in the
+current directory, or your home directory if that is not writable), so you can
+read it afterwards or paste it somewhere. Double-clicking the script from a file
+manager works too — it holds the window open until you press Enter instead of
+closing the instant it finishes.
 
 ## Preferred fix: a mainline kernel with the quirk
 
