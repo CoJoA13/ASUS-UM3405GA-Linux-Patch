@@ -99,17 +99,36 @@ fi
 # can be redirected through one.
 prepare_report_file() {
 	local path=$1
-	local dir tmpdir
+	local dir tmpdir owner
 
 	if [[ -L "${path}" || ( -e "${path}" && ! -f "${path}" ) ]]; then
 		printf 'Refusing to write the report to %s: not a regular file.\n' "${path}" >&2
 		return 1
 	fi
 
+	dir=$(dirname -- "${path}")
+
+	# Under sudo the finished report is handed to the invoking user, so it must
+	# only ever land somewhere that user could already write. Without this, a
+	# sudoers rule permitting this script would let them name any regular file
+	# on the system and end up owning it.
+	if [[ -n "${SUDO_UID:-}" ]]; then
+		if [[ -e "${path}" ]]; then
+			owner=$(stat -c %u -- "${path}" 2>/dev/null)
+		else
+			owner=$(stat -c %u -- "${dir}" 2>/dev/null)
+		fi
+
+		if [[ "${owner}" != "${SUDO_UID}" ]]; then
+			printf 'Refusing to write the report to %s: it is not owned by uid %s.\n' \
+				"${path}" "${SUDO_UID}" >&2
+			return 1
+		fi
+	fi
+
 	# Build the report inside a private 0700 directory beside the destination,
 	# so no other user can swap the path out from under the write, the chmod or
 	# the rename. Same directory keeps the final rename on one filesystem.
-	dir=$(dirname -- "${path}")
 	tmpdir=$(mktemp -d -- "${dir}/.um3405ga-report.XXXXXX" 2>/dev/null) || return 1
 	printf '%s\n' "${tmpdir}/report"
 }
@@ -291,7 +310,7 @@ run_report() {
 
 		alg_reject_re='No [^ ]+ for algorithm'
 		if [[ "${klog}" =~ ${alg_reject_re} ]]; then
-			note 'DSP rejected coefficient blocks (algorithm not in the loaded firmware); the borrowed tuning is not fully applied'
+			note 'DSP rejected coefficient blocks during at least one firmware load this boot (algorithm not in the loaded firmware); reboot and re-check to see the current state'
 		fi
 	else
 		printf 'Kernel log not readable; re-run as root for amplifier details.\n'
@@ -301,13 +320,21 @@ run_report() {
 	if command -v amixer >/dev/null 2>&1; then
 		ctl_card=${CARD:-}
 		if [[ -z "${ctl_card}" ]]; then
-			for codec in /proc/asound/card*/codec#*; do
-				[[ -e "${codec}" ]] || continue
-				if grep -q '^Codec: Realtek ALC294$' "${codec}"; then
+			# Prefer the ALC294 whose subsystem is this machine's; fall back to any
+			# ALC294 so a different subsystem ID still gets a report rather than an
+			# empty section.
+			for want_ssid in 1 0; do
+				for codec in /proc/asound/card*/codec#*; do
+					[[ -e "${codec}" ]] || continue
+					grep -q '^Codec: Realtek ALC294$' "${codec}" || continue
+					if [[ "${want_ssid}" == "1" ]] &&
+						! grep -qi "^Subsystem Id: 0x${target_ssid}\$" "${codec}"; then
+						continue
+					fi
 					ctl_card=${codec#/proc/asound/card}
 					ctl_card=${ctl_card%%/*}
-					break
-				fi
+					break 2
+				done
 			done
 		fi
 
@@ -328,6 +355,11 @@ run_report() {
 	# an oops or hung task in it is worth surfacing here.
 	if journalctl -k -b -1 --no-pager >/dev/null 2>&1; then
 		for prev in -1 -2; do
+			if ! journalctl -k -b "${prev}" --no-pager >/dev/null 2>&1; then
+				printf 'boot %s: not in the journal\n' "${prev}"
+				continue
+			fi
+
 			# Anchored to real crash records: a bare "panic" also matches the
 			# ordinary "Command line: ... panic=30" line that many systems log on
 			# every clean boot.
