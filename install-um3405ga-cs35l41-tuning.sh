@@ -162,6 +162,22 @@ install_alias() {
 	printf 'Installed %s:\n  %s -> %s\n' "${label}" "${src}" "${dst}"
 }
 
+# An alias whose name differs only in case cannot be requested by anything, so
+# it is dead weight that also makes the firmware listing look installed. These
+# are files this script created, and they are renamed rather than deleted.
+disable_wrong_case() {
+	local file base prefix="cs35l41-dsp1-spk-prot-${target_ssid}"
+
+	while read -r file; do
+		base=${file##*/}
+		[[ "${base:0:${#prefix}}" == "${prefix}" ]] && continue
+		mv "${file}" "${file}.disabled-um3405ga-${stamp}"
+		printf 'Disabled an alias the driver can never request (wrong case):\n  %s\n' "${file}"
+	done < <(find "${firmware_dir}" -maxdepth 1 \
+		-iname "${prefix}-*" \
+		! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' | sort)
+}
+
 install_variant() {
 	local spkid=$1
 	local amp donor coeff_src wmfw_src coeff_dst wmfw_dst suffix
@@ -210,7 +226,7 @@ restore_target() {
 		mv "${file}" "${disabled}"
 		printf 'Disabled:\n  %s\n' "${disabled}"
 	done < <(find "${firmware_dir}" -maxdepth 1 \
-		-name "cs35l41-dsp1-spk-prot-${target_ssid}-*" \
+		-iname "cs35l41-dsp1-spk-prot-${target_ssid}-*" \
 		! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' | sort)
 
 	if [[ "${found}" == "0" ]]; then
@@ -288,6 +304,14 @@ else
 	target_ssid=${target_ssid:-${fallback_ssid}}
 fi
 
+# cs35l41_request_firmware_file() lowercases the whole filename before asking
+# for it, but the kernel log prints the SSID upper case ("SSID: 104319F4").
+# Passing the logged spelling through installs 104319F4 aliases that nothing
+# will ever request: the files are present, the driver still falls back to the
+# generic firmware, and the speaker stays quiet with no error anywhere.
+target_ssid=${target_ssid,,}
+donor_ssid=${donor_ssid,,}
+
 declare -a variants=()
 if [[ -n "${target_spkid}" ]]; then
 	variants=("${target_spkid}")
@@ -301,6 +325,7 @@ fi
 
 case "${action}" in
 	install)
+		disable_wrong_case
 		for variant in "${variants[@]}"; do
 			install_variant "${variant}"
 		done

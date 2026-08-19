@@ -682,8 +682,12 @@ run_report() {
 		for ssid in "${target_ssid}" "${donor_ssid}"; do
 			# Disabled and backup copies cannot satisfy the name the driver asks
 			# for, so listing them would misreport the tuning as installed.
+			# -iname, not -name: the driver lowercases every filename it
+			# requests, so an alias installed from the kernel log's upper-case
+			# "SSID: 104319F4" is invisible to a case-exact search and to the
+			# loader alike -- present on disk, never asked for.
 			mapfile -t found < <(find "${firmware_dir}" -maxdepth 1 \
-				-name "cs35l41-dsp1-spk-prot-${ssid}*" \
+				-iname "cs35l41-dsp1-spk-prot-${ssid}*" \
 				! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' \
 				-printf '%f\n' 2>/dev/null | sort)
 
@@ -693,18 +697,21 @@ run_report() {
 			# to nothing, to a directory, or to an empty file is a name the
 			# loader cannot use, and counting it is how a broken install reads
 			# as a healthy one.
+			fw_prefix="cs35l41-dsp1-spk-prot-${ssid}"
 			matches=()
 			unusable=()
 			for entry in "${found[@]}"; do
-				if [[ -f "${firmware_dir}/${entry}" && -s "${firmware_dir}/${entry}" ]]; then
+				if [[ "${entry:0:${#fw_prefix}}" != "${fw_prefix}" ]]; then
+					unusable+=("${entry} [wrong case: the driver asks for ${fw_prefix}...]")
+				elif [[ -f "${firmware_dir}/${entry}" && -s "${firmware_dir}/${entry}" ]]; then
 					matches+=("${entry}")
 				else
-					unusable+=("${entry}")
+					unusable+=("${entry} [dangling alias, empty, or not a regular file]")
 				fi
 			done
 
 			if [[ ${#unusable[@]} -gt 0 ]]; then
-				printf '%s: %s name(s) present but not loadable (dangling alias, empty or not a file):\n' \
+				printf '%s: %s name(s) present that the driver cannot load:\n' \
 					"${ssid}" "${#unusable[@]}"
 				printf '  %s\n' "${unusable[@]}"
 			fi
