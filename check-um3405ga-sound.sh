@@ -691,12 +691,13 @@ run_report() {
 				! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' \
 				-printf '%f\n' 2>/dev/null | sort)
 
-			# The installer creates these as symlinks into linux-firmware, so a
-			# package update that drops the donor leaves the name in place and
-			# the target gone. -f and -s follow the link: an alias that resolves
-			# to nothing, to a directory, or to an empty file is a name the
-			# loader cannot use, and counting it is how a broken install reads
-			# as a healthy one.
+			# -f and -s follow symlinks, so an alias that resolves to nothing,
+			# to a directory, or to an empty file is excluded: those are names
+			# the loader cannot use, and counting them is how a broken install
+			# reads as a healthy one. install-um3405ga-cs35l41-tuning.sh copies
+			# rather than links, so it does not produce dangling aliases itself
+			# -- this covers a hand-made link and an interrupted or truncated
+			# copy.
 			fw_prefix="cs35l41-dsp1-spk-prot-${ssid}"
 			matches=()
 			unusable=()
