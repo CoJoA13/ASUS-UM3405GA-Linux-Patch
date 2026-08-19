@@ -92,72 +92,45 @@ if [[ "${pause}" == "auto" ]]; then
 	fi
 fi
 
-# The report name is predictable and this script may be run with sudo from a
-# directory other users can write to. Refuse anything that is not a plain file,
-# then write to a mktemp sibling and rename it into place: rename(2) replaces a
-# symlink rather than following it, so there is no window in which the report
-# can be redirected through one.
+# The report is created as the invoking user, never as root. When this runs
+# under sudo the file work is dropped back to $SUDO_UID, so the kernel decides
+# where the report may land: no ownership check of ours can be raced or fooled
+# by a swapped path component, because root never creates the file at all. That
+# also removes the need to chown it afterwards.
+#
+# A staging directory plus a rename still guards the non-privileged case: the
+# destination name is predictable, and rename(2) replaces a symlink rather than
+# writing through one.
+as_user() {
+	if [[ -n "${SUDO_UID:-}" ]] && command -v setpriv >/dev/null 2>&1; then
+		setpriv --reuid="${SUDO_UID}" --regid="${SUDO_GID:-${SUDO_UID}}" \
+			--clear-groups -- "$@"
+	else
+		"$@"
+	fi
+}
+
 prepare_report_file() {
 	local path=$1
-	local dir tmpdir owner noclobber_was_set=0
+	local dir tmpdir
 
 	report_tmp=''
+
+	if [[ -n "${SUDO_UID:-}" ]] && ! command -v setpriv >/dev/null 2>&1; then
+		printf 'Refusing to write a report under sudo without setpriv to drop privileges.\n' >&2
+		return 1
+	fi
 
 	if [[ -L "${path}" || ( -e "${path}" && ! -f "${path}" ) ]]; then
 		printf 'Refusing to write the report to %s: not a regular file.\n' "${path}" >&2
 		return 1
 	fi
 
-	# Resolve the parent directory once, and use the resolved path from here on.
-	# A caller-owned symlink to a protected directory would otherwise pass the
-	# ownership check below -- stat reads the link, mktemp and mv follow it --
-	# and resolving once also means swapping the link afterwards changes nothing.
-	dir=$(cd -P -- "$(dirname -- "${path}")" 2>/dev/null && pwd -P) || {
-		printf 'Refusing to write the report to %s: cannot resolve its directory.\n' \
-			"${path}" >&2
-		return 1
-	}
-	path="${dir}/$(basename -- "${path}")"
-	report_file=${path}
+	dir=$(dirname -- "${path}")
+	tmpdir=$(as_user mktemp -d -- "${dir}/.um3405ga-report.XXXXXX" 2>/dev/null) || return 1
 
-	# Under sudo the finished report is handed to the invoking user, so it must
-	# only ever land somewhere that user could already write. Without this, a
-	# sudoers rule permitting this script would let them name any regular file
-	# on the system and end up owning it.
-	if [[ -n "${SUDO_UID:-}" ]]; then
-		if [[ -e "${path}" ]]; then
-			owner=$(stat -c %u -- "${path}" 2>/dev/null)
-		else
-			owner=$(stat -c %u -- "${dir}" 2>/dev/null)
-		fi
-
-		if [[ "${owner}" != "${SUDO_UID}" ]]; then
-			printf 'Refusing to write the report to %s: it is not owned by uid %s.\n' \
-				"${path}" "${SUDO_UID}" >&2
-			return 1
-		fi
-	fi
-
-	# Build the report inside a private 0700 directory beside the destination.
-	# Same directory keeps the final rename on one filesystem.
-	tmpdir=$(mktemp -d -- "${dir}/.um3405ga-report.XXXXXX" 2>/dev/null) || return 1
-
-	# Open the staging file here, while this directory is still the one just
-	# created, and with noclobber so the open is O_EXCL: anything already at that
-	# name -- including a symlink planted by renaming the directory aside and
-	# recreating it -- makes the open fail rather than be followed. Every write
-	# and metadata change afterwards goes through this descriptor.
-	[[ -o noclobber ]] && noclobber_was_set=1
-	set -o noclobber
-	if exec {report_fd}>"${tmpdir}/report"; then
-		report_tmp="${tmpdir}/report"
-		report_tmpdir="${tmpdir}"
-	else
-		rm -rf -- "${tmpdir}"
-	fi
-	[[ "${noclobber_was_set}" == "1" ]] || set +o noclobber
-
-	[[ -n "${report_tmp}" ]]
+	report_tmp="${tmpdir}/report"
+	report_tmpdir="${tmpdir}"
 }
 
 # Called directly, not through command substitution: the descriptor it opens
@@ -173,7 +146,7 @@ else
 fi
 
 if [[ -n "${report_tmp}" ]]; then
-	trap '[[ -n "${report_tmpdir}" ]] && rm -rf -- "${report_tmpdir}"' EXIT
+	trap '[[ -n "${report_tmpdir}" ]] && as_user rm -rf -- "${report_tmpdir}"' EXIT
 else
 	printf 'Could not create a report file; printing to the terminal only.\n' >&2
 	exit_status=1
@@ -440,15 +413,21 @@ run_report() {
 			# interrupted live reload, say) still appears in the dump while the DSP
 			# runs untuned, and the boot journal keeps its earlier "Firmware Loaded"
 			# line either way. Read the values.
-			fw_ctl_found=0
+			# Track the amps individually: one amp failing to initialise leaves its
+			# controls absent entirely, which a single "did we see any" flag would
+			# read as success while that speaker has no DSP at all.
+			fw_ctl_amps=''
 			fw_ctl_off=''
 			ctl_name=''
 			ctl_name_re="name='([^']*DSP1 Firmware[^']*)'"
 			while IFS= read -r ctl_line; do
 				if [[ "${ctl_line}" =~ ${ctl_name_re} ]]; then
-					fw_ctl_found=1
 					ctl_name=${BASH_REMATCH[1]}
-					[[ "${ctl_name}" == *'Firmware Load'* ]] || ctl_name=''
+					if [[ "${ctl_name}" == *'Firmware Load'* ]]; then
+						fw_ctl_amps+=" ${ctl_name%% *}"
+					else
+						ctl_name=''
+					fi
 					continue
 				fi
 				if [[ -n "${ctl_name}" && "${ctl_line}" =~ ^[[:space:]]*:[[:space:]]*values=(.*)$ ]]; then
@@ -457,9 +436,16 @@ run_report() {
 				fi
 			done <<<"${controls}"
 
-			if [[ "${fw_ctl_found}" == "0" ]]; then
-				note 'No CS35L41 "DSP1 Firmware" controls on the ALC294 card; the amplifiers did not initialise'
-			elif [[ -n "${fw_ctl_off}" ]]; then
+			# This machine has two CS35L41 amps, so it should expose two of these.
+			read -r -a fw_ctl_amp_list <<<"${fw_ctl_amps}"
+			if [[ ${#fw_ctl_amp_list[@]} -eq 0 ]]; then
+				note 'No CS35L41 "DSP1 Firmware Load" controls on the ALC294 card; the amplifiers did not initialise'
+			elif [[ ${#fw_ctl_amp_list[@]} -lt 2 ]]; then
+				printf '  only one amp exposes a firmware-load control:%s\n' "${fw_ctl_amps}"
+				note "Only ${#fw_ctl_amp_list[@]} CS35L41 firmware-load control present (expected 2, one per amp); the other amp did not initialise"
+			fi
+
+			if [[ -n "${fw_ctl_off}" ]]; then
 				printf '  DSP firmware load is currently OFF on:%s\n' "${fw_ctl_off}"
 				note 'CS35L41 DSP firmware load is switched off; those amps are running untuned regardless of what the boot log says'
 			fi
@@ -535,37 +521,19 @@ run_report() {
 }
 
 if [[ -n "${report_tmp}" ]]; then
-	# Write and set permissions through the descriptor opened above, never
-	# through the pathname: rename permission on the temporary directory belongs
-	# to its parent, so a shared working directory means the path can be moved
-	# aside mid-run. A descriptor stays bound to the file that was opened.
-	run_report | tee --output-error=warn-nopipe -- "/dev/fd/${report_fd}"
+	# tee runs as the invoking user, so the write is bounded by their own
+	# permissions. --output-error=warn-nopipe keeps the file complete when a
+	# downstream consumer such as head exits early.
+	run_report | as_user tee --output-error=warn-nopipe -- "${report_tmp}"
 	tee_status=${PIPESTATUS[1]}
 
 	# The report quotes the kernel log, which may be root-only, so keep it
-	# private and hand it to whoever invoked sudo rather than world-readable.
+	# readable only by its owner.
 	if [[ "${tee_status}" == "0" ]] &&
-		chmod 0600 -- "/proc/self/fd/${report_fd}" 2>/dev/null &&
-		{ [[ -z "${SUDO_UID:-}" ]] ||
-			chown "${SUDO_UID}:${SUDO_GID:-${SUDO_UID}}" -- \
-				"/proc/self/fd/${report_fd}" 2>/dev/null; }; then
-		# Remember which file the descriptor refers to, so success is only
-		# claimed when the destination really is that file afterwards.
-		# -L because stat does not dereference by default, and this path is a
-		# symlink into the process's own descriptor table.
-		report_inode=$(stat -L -c %i -- "/proc/self/fd/${report_fd}" 2>/dev/null)
-		exec {report_fd}>&-
-		if mv -fT -- "${report_tmp}" "${report_file}" 2>/dev/null &&
-			[[ -n "${report_inode}" &&
-				"$(stat -c %i -- "${report_file}" 2>/dev/null)" == "${report_inode}" ]]; then
-			printf '\nSaved this report to:\n  %s\n' "${report_file}"
-		else
-			printf '\nFailed to move the report into place at %s.\n' "${report_file}" >&2
-			printf 'The report above is complete.\n' >&2
-			exit_status=1
-		fi
+		as_user chmod 0600 -- "${report_tmp}" 2>/dev/null &&
+		as_user mv -fT -- "${report_tmp}" "${report_file}" 2>/dev/null; then
+		printf '\nSaved this report to:\n  %s\n' "${report_file}"
 	else
-		exec {report_fd}>&-
 		printf '\nFailed to save the report to %s (tee exited %s).\n' \
 			"${report_file}" "${tee_status}" >&2
 		printf 'The report above is complete.\n' >&2
