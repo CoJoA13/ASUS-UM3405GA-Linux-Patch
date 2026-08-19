@@ -99,7 +99,9 @@ fi
 # can be redirected through one.
 prepare_report_file() {
 	local path=$1
-	local dir tmpdir owner
+	local dir tmpdir owner noclobber_was_set=0
+
+	report_tmp=''
 
 	if [[ -L "${path}" || ( -e "${path}" && ! -f "${path}" ) ]]; then
 		printf 'Refusing to write the report to %s: not a regular file.\n' "${path}" >&2
@@ -126,25 +128,41 @@ prepare_report_file() {
 		fi
 	fi
 
-	# Build the report inside a private 0700 directory beside the destination,
-	# so no other user can swap the path out from under the write, the chmod or
-	# the rename. Same directory keeps the final rename on one filesystem.
+	# Build the report inside a private 0700 directory beside the destination.
+	# Same directory keeps the final rename on one filesystem.
 	tmpdir=$(mktemp -d -- "${dir}/.um3405ga-report.XXXXXX" 2>/dev/null) || return 1
-	printf '%s\n' "${tmpdir}/report"
+
+	# Open the staging file here, while this directory is still the one just
+	# created, and with noclobber so the open is O_EXCL: anything already at that
+	# name -- including a symlink planted by renaming the directory aside and
+	# recreating it -- makes the open fail rather than be followed. Every write
+	# and metadata change afterwards goes through this descriptor.
+	[[ -o noclobber ]] && noclobber_was_set=1
+	set -o noclobber
+	if exec {report_fd}>"${tmpdir}/report"; then
+		report_tmp="${tmpdir}/report"
+		report_tmpdir="${tmpdir}"
+	else
+		rm -rf -- "${tmpdir}"
+	fi
+	[[ "${noclobber_was_set}" == "1" ]] || set +o noclobber
+
+	[[ -n "${report_tmp}" ]]
 }
 
+# Called directly, not through command substitution: the descriptor it opens
+# has to survive into this shell.
 if [[ -n "${report_file}" ]]; then
-	report_tmp=$(prepare_report_file "${report_file}") || report_file=''
+	prepare_report_file "${report_file}" || report_file=''
 else
 	report_file="${PWD}/um3405ga-sound-report.txt"
-	if ! report_tmp=$(prepare_report_file "${report_file}"); then
+	if ! prepare_report_file "${report_file}"; then
 		report_file="${HOME:-/tmp}/um3405ga-sound-report.txt"
-		report_tmp=$(prepare_report_file "${report_file}") || report_file=''
+		prepare_report_file "${report_file}" || report_file=''
 	fi
 fi
 
 if [[ -n "${report_tmp}" ]]; then
-	report_tmpdir=$(dirname -- "${report_tmp}")
 	trap '[[ -n "${report_tmpdir}" ]] && rm -rf -- "${report_tmpdir}"' EXIT
 else
 	printf 'Could not create a report file; printing to the terminal only.\n' >&2
@@ -290,10 +308,14 @@ run_report() {
 		# Matched in-shell rather than through `| grep -q`: grep exits on the
 		# first hit, the writer takes SIGPIPE, and pipefail then reports 141 for a
 		# pipeline that did match, silently dropping these findings.
-		if [[ "${klog}" == *'Falling back to default firmware'* ]]; then
+		# Whichever marker came last is the current state: a reload leaves the
+		# earlier attempt's line in the same boot.
+		last_state=$(printf '%s\n' "${klog}" |
+			grep -E 'Falling back to default firmware|Firmware Loaded' | tail -1)
+		if [[ "${last_state}" == *'Falling back to default firmware'* ]]; then
 			printf 'DSP firmware: generic fallback in use (speakers will be quiet).\n'
 			note 'CS35L41 fell back to generic firmware; the board tuning was not requested or not found'
-		elif [[ "${klog}" == *'Firmware Loaded'* ]]; then
+		elif [[ "${last_state}" == *'Firmware Loaded'* ]]; then
 			printf 'DSP firmware: board tuning loaded.\n'
 		fi
 
@@ -406,18 +428,12 @@ run_report() {
 	fi
 }
 
-if [[ -n "${report_tmp}" ]] && ! exec {report_fd}>"${report_tmp}"; then
-	printf 'Could not open %s for writing.\n' "${report_tmp}" >&2
-	report_tmp=''
-	exit_status=1
-fi
-
 if [[ -n "${report_tmp}" ]]; then
 	# Write and set permissions through the descriptor opened above, never
 	# through the pathname: rename permission on the temporary directory belongs
 	# to its parent, so a shared working directory means the path can be moved
 	# aside mid-run. A descriptor stays bound to the file that was opened.
-	run_report | tee -- "/dev/fd/${report_fd}"
+	run_report | tee --output-error=warn-nopipe -- "/dev/fd/${report_fd}"
 	tee_status=${PIPESTATUS[1]}
 
 	# The report quotes the kernel log, which may be root-only, so keep it
