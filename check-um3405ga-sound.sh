@@ -17,6 +17,7 @@ problems=0
 notes=()
 report_file=${REPORT_FILE:-}
 report_tmp=''
+report_tmpdir=''
 pause=${PAUSE:-auto}
 exit_status=0
 
@@ -75,7 +76,8 @@ should_pause() {
 
 	if [[ -r "/proc/${PPID}/cmdline" ]]; then
 		while IFS= read -r -d '' arg; do
-			[[ "${arg}" == "-c" ]] && return 0
+			# -c, and combined invocations such as `bash -lc` or `sh -ic`.
+			[[ "${arg}" =~ ^-[^-]*c ]] && return 0
 		done <"/proc/${PPID}/cmdline"
 	fi
 
@@ -97,15 +99,19 @@ fi
 # can be redirected through one.
 prepare_report_file() {
 	local path=$1
-	local tmp
+	local dir tmpdir
 
 	if [[ -L "${path}" || ( -e "${path}" && ! -f "${path}" ) ]]; then
 		printf 'Refusing to write the report to %s: not a regular file.\n' "${path}" >&2
 		return 1
 	fi
 
-	tmp=$(mktemp -- "${path}.XXXXXX" 2>/dev/null) || return 1
-	printf '%s\n' "${tmp}"
+	# Build the report inside a private 0700 directory beside the destination,
+	# so no other user can swap the path out from under the write, the chmod or
+	# the rename. Same directory keeps the final rename on one filesystem.
+	dir=$(dirname -- "${path}")
+	tmpdir=$(mktemp -d -- "${dir}/.um3405ga-report.XXXXXX" 2>/dev/null) || return 1
+	printf '%s\n' "${tmpdir}/report"
 }
 
 if [[ -n "${report_file}" ]]; then
@@ -119,7 +125,8 @@ else
 fi
 
 if [[ -n "${report_tmp}" ]]; then
-	trap 'rm -f -- "${report_tmp}"' EXIT
+	report_tmpdir=$(dirname -- "${report_tmp}")
+	trap '[[ -n "${report_tmpdir}" ]] && rm -rf -- "${report_tmpdir}"' EXIT
 else
 	printf 'Could not create a report file; printing to the terminal only.\n' >&2
 	exit_status=1
@@ -251,7 +258,9 @@ run_report() {
 
 	section 'CS35L41 amplifiers'
 	if journalctl -k -b --no-pager >/dev/null 2>&1; then
-		bound=$(journalctl -k -b --no-pager 2>/dev/null | grep -F 'CS35L41 Bound' | tail -4)
+		klog=$(journalctl -k -b --no-pager 2>/dev/null)
+
+		bound=$(printf '%s\n' "${klog}" | grep -F 'CS35L41 Bound' | tail -4)
 		if [[ -n "${bound}" ]]; then
 			printf '%s\n' "${bound}" | sed 's/^.*cs35l41-hda/cs35l41-hda/'
 		else
@@ -259,14 +268,78 @@ run_report() {
 			note 'CS35L41 amps did not bind this boot'
 		fi
 
-		if journalctl -k -b --no-pager 2>/dev/null | grep -qF 'Falling back to default firmware'; then
+		if printf '%s\n' "${klog}" | grep -qF 'Falling back to default firmware'; then
 			printf 'DSP firmware: generic fallback in use (speakers will be quiet).\n'
-			note 'CS35L41 fell back to generic firmware; run install-um3405ga-cs35l41-tuning.sh install'
-		elif journalctl -k -b --no-pager 2>/dev/null | grep -qF 'Firmware Loaded'; then
+			note 'CS35L41 fell back to generic firmware; the board tuning was not requested or not found'
+		elif printf '%s\n' "${klog}" | grep -qF 'Firmware Loaded'; then
 			printf 'DSP firmware: board tuning loaded.\n'
+		fi
+
+		# Coefficient blocks are matched to the algorithms in the loaded .wmfw.
+		# Mismatches are logged rather than fatal, so these lines are what says
+		# whether borrowed tuning actually applied.
+		detail=$(printf '%s\n' "${klog}" |
+			grep -iE 'cs35l41|cs_dsp|Firmware Loaded|Falling back|for algorithm|coefficient version|Bypassing Firmware|Cannot Run Firmware|Unable to find firmware' |
+			tail -25)
+		if [[ -n "${detail}" ]]; then
+			printf '\nAmplifier/DSP log lines (last 25):\n'
+			printf '%s\n' "${detail}" | sed 's/^.*\] //'
+		fi
+
+		if printf '%s\n' "${klog}" | grep -qE 'No .* for algorithm'; then
+			note 'DSP rejected coefficient blocks (algorithm not in the loaded firmware); the borrowed tuning is not fully applied'
 		fi
 	else
 		printf 'Kernel log not readable; re-run as root for amplifier details.\n'
+	fi
+
+	section 'ALSA amplifier controls'
+	if command -v amixer >/dev/null 2>&1; then
+		ctl_card=${CARD:-}
+		if [[ -z "${ctl_card}" ]]; then
+			for codec in /proc/asound/card*/codec#*; do
+				[[ -e "${codec}" ]] || continue
+				if grep -q '^Codec: Realtek ALC294$' "${codec}"; then
+					ctl_card=${codec#/proc/asound/card}
+					ctl_card=${ctl_card%%/*}
+					break
+				fi
+			done
+		fi
+
+		if [[ -n "${ctl_card}" ]]; then
+			printf 'Card %s:\n' "${ctl_card}"
+			amixer -c "${ctl_card}" contents 2>/dev/null |
+				grep -A1 -iE "name='.*(DSP1 Firmware|Speaker|Gain|Boost|Master)" |
+				grep -viE '^--$' | sed 's/^/  /' | head -40
+		else
+			printf 'No ALC294 card found; pass CARD=<n> to inspect a specific card.\n'
+		fi
+	else
+		printf 'amixer not installed (apt install alsa-utils).\n'
+	fi
+
+	section 'Previous boots'
+	# A hard reset leaves no clean shutdown, so an unexpectedly ended boot with
+	# an oops or hung task in it is worth surfacing here.
+	if journalctl -k -b -1 --no-pager >/dev/null 2>&1; then
+		for prev in -1 -2; do
+			crash=$(journalctl -k -b "${prev}" --no-pager 2>/dev/null |
+				grep -iE 'Oops|kernel BUG|call trace|hung task|watchdog: BUG|panic|general protection fault' |
+				tail -8)
+			if [[ -n "${crash}" ]]; then
+				printf 'boot %s: crash evidence found\n' "${prev}"
+				printf '%s\n' "${crash}" | sed 's/^.*\] //' | sed 's/^/  /'
+				note "kernel crash evidence in boot ${prev}"
+			else
+				printf 'boot %s: no oops/panic/hung-task recorded\n' "${prev}"
+			fi
+		done
+		printf 'A hard lockup often leaves nothing on disk, so a clean previous boot\n'
+		printf 'here does not rule one out.\n'
+	else
+		printf 'No earlier boots in the journal (persistent logging may be off:\n'
+		printf 'enable it with "sudo mkdir -p /var/log/journal && sudo systemd-tmpfiles --create --prefix /var/log/journal").\n'
 	fi
 
 	section 'CS35L41 firmware files'
@@ -299,7 +372,7 @@ if [[ -n "${report_tmp}" ]]; then
 	tee_status=${PIPESTATUS[1]}
 	if [[ "${tee_status}" == "0" ]] &&
 		chmod 0644 -- "${report_tmp}" 2>/dev/null &&
-		mv -f -- "${report_tmp}" "${report_file}" 2>/dev/null; then
+		mv -fT -- "${report_tmp}" "${report_file}" 2>/dev/null; then
 		printf '\nSaved this report to:\n  %s\n' "${report_file}"
 	else
 		printf '\nFailed to save the report to %s (tee exited %s).\n' \

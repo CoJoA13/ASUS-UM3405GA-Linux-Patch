@@ -21,6 +21,7 @@ target_ssid=${TARGET_SSID:-}
 target_spkid=${TARGET_SPKID:-}
 donor_spkid=${DONOR_SPKID:-}
 fallback_ssid=104319f4
+reload=${RELOAD:-0}
 amps=(l0 r0)
 stamp=$(date +%Y%m%d%H%M%S)
 
@@ -36,6 +37,7 @@ Environment overrides:
   DONOR_SPKID=<n>        (default: the donor file matching the target speaker ID)
   TARGET_SSID=<hex>      (default: read from the kernel log, else ${fallback_ssid})
   TARGET_SPKID=<n|none>  (default: read from the kernel log, else every variant)
+  RELOAD=1               (reload the DSP live instead of asking for a reboot)
   CARD=<alsa card number>
 EOF
 }
@@ -301,10 +303,17 @@ case "${action}" in
 		;;
 esac
 
-if card=$(find_alc294_card); then
-	reload_firmware "${card}" || true
+# Toggling DSP firmware load at runtime pokes the amps over I2C while the audio
+# stack is live. A reboot applies the same files with none of that risk, so the
+# live reload is opt-in.
+if [[ "${reload}" == "1" ]]; then
+	if card=$(find_alc294_card); then
+		reload_firmware "${card}" || true
+	else
+		printf 'Could not auto-detect the UM3405GA ALC294 ALSA card; reboot to load the tuning.\n'
+	fi
 else
-	printf 'Could not auto-detect the UM3405GA ALC294 ALSA card; reboot to load the tuning.\n'
+	printf '\nReboot to load the tuning (or re-run with RELOAD=1 to reload the DSP now).\n'
 fi
 
 printf '\nStart at a low volume, then check the CS35L41 firmware log with:\n'
