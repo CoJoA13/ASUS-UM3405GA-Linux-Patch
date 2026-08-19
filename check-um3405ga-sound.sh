@@ -328,8 +328,11 @@ run_report() {
 	# an oops or hung task in it is worth surfacing here.
 	if journalctl -k -b -1 --no-pager >/dev/null 2>&1; then
 		for prev in -1 -2; do
+			# Anchored to real crash records: a bare "panic" also matches the
+			# ordinary "Command line: ... panic=30" line that many systems log on
+			# every clean boot.
 			crash=$(journalctl -k -b "${prev}" --no-pager 2>/dev/null |
-				grep -iE 'Oops|kernel BUG|call trace|hung task|watchdog: BUG|panic|general protection fault' |
+				grep -E 'Kernel panic - not syncing|Oops: |BUG: |general protection fault|watchdog: BUG: soft lockup|INFO: task .* blocked for more than' |
 				tail -8)
 			if [[ -n "${crash}" ]]; then
 				printf 'boot %s: crash evidence found\n' "${prev}"
@@ -371,14 +374,44 @@ run_report() {
 	fi
 }
 
+if [[ -n "${report_tmp}" ]] && ! exec {report_fd}>"${report_tmp}"; then
+	printf 'Could not open %s for writing.\n' "${report_tmp}" >&2
+	report_tmp=''
+	exit_status=1
+fi
+
 if [[ -n "${report_tmp}" ]]; then
-	run_report | tee -- "${report_tmp}"
+	# Write and set permissions through the descriptor opened above, never
+	# through the pathname: rename permission on the temporary directory belongs
+	# to its parent, so a shared working directory means the path can be moved
+	# aside mid-run. A descriptor stays bound to the file that was opened.
+	run_report | tee -- "/dev/fd/${report_fd}"
 	tee_status=${PIPESTATUS[1]}
+
+	# The report quotes the kernel log, which may be root-only, so keep it
+	# private and hand it to whoever invoked sudo rather than world-readable.
 	if [[ "${tee_status}" == "0" ]] &&
-		chmod 0644 -- "${report_tmp}" 2>/dev/null &&
-		mv -fT -- "${report_tmp}" "${report_file}" 2>/dev/null; then
-		printf '\nSaved this report to:\n  %s\n' "${report_file}"
+		chmod 0600 -- "/proc/self/fd/${report_fd}" 2>/dev/null &&
+		{ [[ -z "${SUDO_UID:-}" ]] ||
+			chown "${SUDO_UID}:${SUDO_GID:-${SUDO_UID}}" -- \
+				"/proc/self/fd/${report_fd}" 2>/dev/null; }; then
+		# Remember which file the descriptor refers to, so success is only
+		# claimed when the destination really is that file afterwards.
+		# -L because stat does not dereference by default, and this path is a
+		# symlink into the process's own descriptor table.
+		report_inode=$(stat -L -c %i -- "/proc/self/fd/${report_fd}" 2>/dev/null)
+		exec {report_fd}>&-
+		if mv -fT -- "${report_tmp}" "${report_file}" 2>/dev/null &&
+			[[ -n "${report_inode}" &&
+				"$(stat -c %i -- "${report_file}" 2>/dev/null)" == "${report_inode}" ]]; then
+			printf '\nSaved this report to:\n  %s\n' "${report_file}"
+		else
+			printf '\nFailed to move the report into place at %s.\n' "${report_file}" >&2
+			printf 'The report above is complete.\n' >&2
+			exit_status=1
+		fi
 	else
+		exec {report_fd}>&-
 		printf '\nFailed to save the report to %s (tee exited %s).\n' \
 			"${report_file}" "${tee_status}" >&2
 		printf 'The report above is complete.\n' >&2
