@@ -36,41 +36,79 @@ Environment overrides:
 EOF
 }
 
-case "${1:-}" in
-	--pause) pause=1 ;;
-	--no-pause) pause=0 ;;
-	--help|-h)
-		usage
-		exit 0
-		;;
-	'') ;;
-	*)
-		usage >&2
-		exit 2
-		;;
-esac
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--pause) pause=1 ;;
+		--no-pause) pause=0 ;;
+		--help|-h)
+			usage
+			exit 0
+			;;
+		*)
+			usage >&2
+			exit 2
+			;;
+	esac
+	shift
+done
 
 # A double-clicked script gets a terminal that closes the instant it exits, so
-# hold the window open unless this was started from a shell.
+# hold the window open unless this was started from a shell prompt. A launcher
+# shell (`sh -c /path/to/script`, which is how several file managers and
+# x-terminal-emulator start things) looks like a shell parent but closes just
+# the same, so it is told apart by the -c in its command line.
+should_pause() {
+	local comm arg
+
+	[[ -t 1 ]] || return 1
+
+	comm=$(ps -o comm= -p "${PPID}" 2>/dev/null)
+	# Unknown parent: never risk holding open a window nobody is watching.
+	[[ -n "${comm}" ]] || return 1
+
+	case "${comm}" in
+		*sh|sudo|doas|tmux*|screen) ;;
+		*) return 0 ;;
+	esac
+
+	if [[ -r "/proc/${PPID}/cmdline" ]]; then
+		while IFS= read -r -d '' arg; do
+			[[ "${arg}" == "-c" ]] && return 0
+		done <"/proc/${PPID}/cmdline"
+	fi
+
+	return 1
+}
+
 if [[ "${pause}" == "auto" ]]; then
-	pause=0
-	if [[ -t 1 ]]; then
-		case "$(ps -o comm= -p "${PPID}" 2>/dev/null)" in
-			*sh|sudo|tmux*|screen|doas) ;;
-			'') ;;
-			*) pause=1 ;;
-		esac
+	if should_pause; then
+		pause=1
+	else
+		pause=0
 	fi
 fi
+
+# The report name is predictable and this script may be run with sudo from a
+# directory other users can write to, so never write through a planted symlink
+# or into anything that is not a plain file.
+prepare_report_file() {
+	local path=$1
+
+	if [[ -L "${path}" || ( -e "${path}" && ! -f "${path}" ) ]]; then
+		printf 'Refusing to write the report to %s: not a regular file.\n' "${path}" >&2
+		return 1
+	fi
+
+	: >"${path}" 2>/dev/null
+}
 
 if [[ -z "${report_file}" ]]; then
 	report_file="${PWD}/um3405ga-sound-report.txt"
-	if ! : >"${report_file}" 2>/dev/null; then
+	if ! prepare_report_file "${report_file}"; then
 		report_file="${HOME:-/tmp}/um3405ga-sound-report.txt"
+		prepare_report_file "${report_file}" || report_file=''
 	fi
-fi
-
-if ! : >"${report_file}" 2>/dev/null; then
+elif ! prepare_report_file "${report_file}"; then
 	report_file=''
 fi
 
@@ -243,9 +281,19 @@ run_report() {
 	fi
 }
 
+exit_status=0
+
 if [[ -n "${report_file}" ]]; then
-	run_report | tee "${report_file}"
-	printf '\nSaved this report to:\n  %s\n' "${report_file}"
+	run_report | tee -- "${report_file}"
+	tee_status=${PIPESTATUS[1]}
+	if [[ "${tee_status}" == "0" ]]; then
+		printf '\nSaved this report to:\n  %s\n' "${report_file}"
+	else
+		printf '\nFailed to write the report to %s (tee exited %s).\n' \
+			"${report_file}" "${tee_status}" >&2
+		printf 'The report above is complete; the saved copy may be truncated.\n' >&2
+		exit_status=1
+	fi
 else
 	run_report
 fi
@@ -254,3 +302,5 @@ if [[ "${pause}" == "1" ]]; then
 	printf '\nPress Enter to close this window...'
 	read -r || true
 fi
+
+exit "${exit_status}"
