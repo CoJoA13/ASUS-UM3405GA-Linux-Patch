@@ -308,15 +308,35 @@ run_report() {
 		# Matched in-shell rather than through `| grep -q`: grep exits on the
 		# first hit, the writer takes SIGPIPE, and pipefail then reports 141 for a
 		# pipeline that did match, silently dropping these findings.
-		# Whichever marker came last is the current state: a reload leaves the
-		# earlier attempt's line in the same boot.
-		last_state=$(printf '%s\n' "${klog}" |
-			grep -E 'Falling back to default firmware|Firmware Loaded' | tail -1)
-		if [[ "${last_state}" == *'Falling back to default firmware'* ]]; then
-			printf 'DSP firmware: generic fallback in use (speakers will be quiet).\n'
-			note 'CS35L41 fell back to generic firmware; the board tuning was not requested or not found'
-		elif [[ "${last_state}" == *'Firmware Loaded'* ]]; then
-			printf 'DSP firmware: board tuning loaded.\n'
+		# Each amp logs its own outcome, and they can differ: one speaker can load
+		# board tuning while the other falls back. Track the latest state per
+		# device so a working amp cannot mask a fallen-back one, and so a reload
+		# supersedes that device's earlier attempt.
+		declare -A amp_state=()
+		amp_state_re='cs35l41-hda ([^ ]+): (Falling back|Firmware Loaded)'
+		while IFS= read -r line; do
+			if [[ "${line}" =~ ${amp_state_re} ]]; then
+				amp_state["${BASH_REMATCH[1]}"]=${BASH_REMATCH[2]}
+			fi
+		done < <(printf '%s\n' "${klog}" |
+			grep -E 'Falling back to default firmware|Firmware Loaded')
+
+		fallback_amps=''
+		loaded_amps=''
+		for amp_dev in "${!amp_state[@]}"; do
+			if [[ "${amp_state[${amp_dev}]}" == "Falling back" ]]; then
+				fallback_amps+=" ${amp_dev}"
+			else
+				loaded_amps+=" ${amp_dev}"
+			fi
+		done
+
+		if [[ -n "${loaded_amps}" ]]; then
+			printf 'DSP firmware: board tuning loaded on:%s\n' "${loaded_amps}"
+		fi
+		if [[ -n "${fallback_amps}" ]]; then
+			printf 'DSP firmware: generic fallback in use on:%s\n' "${fallback_amps}"
+			note 'At least one CS35L41 amp fell back to generic firmware; that speaker will be quiet'
 		fi
 
 		# Coefficient blocks are matched to the algorithms in the loaded .wmfw.
@@ -362,11 +382,21 @@ run_report() {
 
 		if [[ -n "${ctl_card}" ]]; then
 			printf 'Card %s:\n' "${ctl_card}"
-			amixer -c "${ctl_card}" contents 2>/dev/null |
+			# When the kernel log is unreadable these controls are the only evidence
+			# that the amps came up, so an empty dump is a finding rather than a
+			# blank section followed by "no problems detected".
+			controls=$(amixer -c "${ctl_card}" contents 2>/dev/null |
 				grep -A2 -iE "name='.*(DSP1 Firmware|Speaker|Gain|Boost|Master)" |
-				grep -viE '^--$' | sed 's/^/  /' | head -60
+				grep -viE '^--$' | head -60)
+			if [[ -n "${controls}" ]]; then
+				printf '%s\n' "${controls}" | sed 's/^/  /'
+			else
+				printf '  none (amixer failed, or the card exposes no matching controls)\n'
+				note 'No CS35L41/speaker controls on the ALC294 card; the amplifiers did not initialise'
+			fi
 		else
 			printf 'No ALC294 card found; pass CARD=<n> to inspect a specific card.\n'
+			note 'No ALC294 codec found in /proc/asound'
 		fi
 	else
 		printf 'amixer not installed (apt install alsa-utils).\n'
