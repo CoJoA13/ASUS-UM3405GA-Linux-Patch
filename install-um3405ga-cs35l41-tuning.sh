@@ -5,17 +5,23 @@ set -euo pipefail
 # reusing the generic WMFW plus the closely related UM3406HA tuning coefficients
 # shipped by linux-firmware.
 #
-# The codec quirk makes the amps bind, but current firmware packages do not
-# ship UM3405GA-specific 104319f4 coefficient files. The 7.0 CS35L41 HDA driver
-# only requests board-specific .bin coefficients after it finds a matching
-# board-specific .wmfw, so create both filenames the driver will request and let
-# the firmware loader use the existing compressed .zst blobs.
+# The codec quirk makes the amps bind, but linux-firmware ships no UM3405GA
+# (104319f4) coefficient files. The CS35L41 HDA driver only requests
+# board-specific .bin coefficients after a board-specific .wmfw matches, so both
+# filenames have to exist before the borrowed tuning is used. linux-firmware
+# ships no board-specific WMFW for the donor either, so the generic
+# cs35l41-dsp1-spk-prot.wmfw is what gets aliased.
+#
+# Which names the driver asks for depends on the speaker-ID GPIO it reads at
+# probe time, so the requested IDs are taken from the kernel log when possible.
 
 firmware_dir=${FIRMWARE_DIR:-/lib/firmware/cirrus}
 donor_ssid=${DONOR_SSID:-10431c03}
-donor_spkid=${DONOR_SPKID:-0}
-target_ssid=${TARGET_SSID:-104319f4}
-target_spkid=${TARGET_SPKID:-1}
+target_ssid=${TARGET_SSID:-}
+target_spkid=${TARGET_SPKID:-}
+donor_spkid=${DONOR_SPKID:-}
+fallback_ssid=104319f4
+amps=(l0 r0)
 stamp=$(date +%Y%m%d%H%M%S)
 
 usage() {
@@ -27,60 +33,122 @@ Usage:
 Environment overrides:
   FIRMWARE_DIR=${firmware_dir}
   DONOR_SSID=${donor_ssid}
-  DONOR_SPKID=${donor_spkid}
-  TARGET_SSID=${target_ssid}
-  TARGET_SPKID=${target_spkid}
+  DONOR_SPKID=<n>        (default: the donor file matching the target speaker ID)
+  TARGET_SSID=<hex>      (default: read from the kernel log, else ${fallback_ssid})
+  TARGET_SPKID=<n|none>  (default: read from the kernel log, else every variant)
   CARD=<alsa card number>
 EOF
 }
 
 action=${1:-install}
 case "${action}" in
-	install|restore|--help|-h) ;;
+	install|restore) ;;
+	--help|-h)
+		usage
+		exit 0
+		;;
 	*)
 		usage >&2
 		exit 2
 		;;
 esac
 
-if [[ "${action}" == "--help" || "${action}" == "-h" ]]; then
-	usage
-	exit 0
-fi
-
 if [[ ${EUID} -ne 0 ]]; then
-	printf 'Run this as root:\n  sudo %q install\n' "$0" >&2
+	printf 'Run this as root:\n  sudo %q %s\n' "$0" "${action}" >&2
 	exit 1
 fi
 
-coeff_file() {
-	local ssid=$1
-	local spkid=$2
-	local amp=$3
+if [[ ! -d "${firmware_dir}" ]]; then
+	printf 'Missing firmware directory: %s\n' "${firmware_dir}" >&2
+	exit 1
+fi
 
-	printf '%s/cs35l41-dsp1-spk-prot-%s-spkid%s-%s.bin.zst\n' \
-		"${firmware_dir}" "${ssid}" "${spkid}" "${amp}"
+# The driver logs "CS35L41 Bound - SSID: 104319f4, ..., SPKID: 1" for each amp.
+# A negative SPKID means the machine has no speaker-ID GPIO, in which case the
+# requested filenames carry no spkid component at all.
+bound_line() {
+	journalctl -k -b --no-pager 2>/dev/null | grep -F 'CS35L41 Bound' | tail -n 1
 }
 
-wmfw_file() {
-	local ssid=$1
-	local spkid=$2
-	local amp=$3
+detect_ids() {
+	local line ssid spkid
 
-	printf '%s/cs35l41-dsp1-spk-prot-%s-spkid%s-%s.wmfw.zst\n' \
-		"${firmware_dir}" "${ssid}" "${spkid}" "${amp}"
+	line=$(bound_line) || return 1
+	[[ -n "${line}" ]] || return 1
+
+	ssid=$(printf '%s\n' "${line}" | sed -n 's/.*SSID: \([0-9a-fA-F]\{1,\}\).*/\1/p')
+	spkid=$(printf '%s\n' "${line}" | sed -n 's/.*SPKID: \(-\{0,1\}[0-9]\{1,\}\).*/\1/p')
+	[[ -n "${ssid}" && -n "${spkid}" ]] || return 1
+
+	if ((spkid < 0)); then
+		spkid=none
+	fi
+
+	printf '%s %s\n' "${ssid}" "${spkid}"
+}
+
+# Firmware may be shipped uncompressed or compressed; the loader tries each
+# suffix, so an alias has to keep the suffix its donor file uses.
+resolve_file() {
+	local base=$1
+	local suffix
+
+	for suffix in .zst .xz ''; do
+		if [[ -f "${base}${suffix}" ]]; then
+			printf '%s\n' "${base}${suffix}"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+base_name() {
+	local ssid=$1 spkid=$2 amp=$3 kind=$4
+
+	if [[ "${spkid}" == "none" ]]; then
+		printf '%s/cs35l41-dsp1-spk-prot-%s-%s.%s\n' "${firmware_dir}" "${ssid}" "${amp}" "${kind}"
+	else
+		printf '%s/cs35l41-dsp1-spk-prot-%s-spkid%s-%s.%s\n' \
+			"${firmware_dir}" "${ssid}" "${spkid}" "${amp}" "${kind}"
+	fi
+}
+
+donor_spkids() {
+	find "${firmware_dir}" -maxdepth 1 -name "cs35l41-dsp1-spk-prot-${donor_ssid}-spkid*-${amps[0]}.bin*" \
+		-printf '%f\n' 2>/dev/null |
+		sed -n 's/.*-spkid\([0-9]\{1,\}\)-.*/\1/p' |
+		sort -un
+}
+
+pick_donor_spkid() {
+	local wanted=$1
+	local -a available=()
+
+	mapfile -t available < <(donor_spkids)
+	if [[ ${#available[@]} -eq 0 ]]; then
+		return 1
+	fi
+
+	if [[ -n "${donor_spkid}" ]]; then
+		printf '%s\n' "${donor_spkid}"
+		return 0
+	fi
+
+	local candidate
+	for candidate in "${available[@]}"; do
+		if [[ "${candidate}" == "${wanted}" ]]; then
+			printf '%s\n' "${candidate}"
+			return 0
+		fi
+	done
+
+	printf '%s\n' "${available[0]}"
 }
 
 install_alias() {
-	local src=$1
-	local dst=$2
-	local label=$3
+	local src=$1 dst=$2 label=$3
 	local backup
-
-	if [[ ! -f "${src}" ]]; then
-		printf 'Missing source for %s:\n  %s\n' "${label}" "${src}" >&2
-		exit 1
-	fi
 
 	if [[ -e "${dst}" ]] && ! cmp -s "${src}" "${dst}"; then
 		backup="${dst}.bak-um3405ga-${stamp}"
@@ -92,38 +160,53 @@ install_alias() {
 	printf 'Installed %s:\n  %s -> %s\n' "${label}" "${src}" "${dst}"
 }
 
-install_one() {
-	local amp=$1
-	local coeff_src coeff_dst wmfw_src wmfw_dst
+install_variant() {
+	local spkid=$1
+	local amp donor coeff_src wmfw_src coeff_dst wmfw_dst suffix
 
-	coeff_src=$(coeff_file "${donor_ssid}" "${donor_spkid}" "${amp}")
-	coeff_dst=$(coeff_file "${target_ssid}" "${target_spkid}" "${amp}")
-	wmfw_src="${firmware_dir}/cs35l41-dsp1-spk-prot.wmfw.zst"
-	wmfw_dst=$(wmfw_file "${target_ssid}" "${target_spkid}" "${amp}")
+	donor=$(pick_donor_spkid "${spkid}") || {
+		printf 'No %s coefficient files found in %s\n' "${donor_ssid}" "${firmware_dir}" >&2
+		exit 1
+	}
 
-	install_alias "${wmfw_src}" "${wmfw_dst}" "${amp} WMFW alias"
-	install_alias "${coeff_src}" "${coeff_dst}" "${amp} coefficient alias"
+	wmfw_src=$(resolve_file "${firmware_dir}/cs35l41-dsp1-spk-prot.wmfw") || {
+		printf 'Missing generic WMFW: %s/cs35l41-dsp1-spk-prot.wmfw\n' "${firmware_dir}" >&2
+		exit 1
+	}
+
+	for amp in "${amps[@]}"; do
+		coeff_src=$(resolve_file "$(base_name "${donor_ssid}" "${donor}" "${amp}" bin)") || {
+			printf 'Missing donor coefficients for %s spkid%s:\n  %s\n' \
+				"${amp}" "${donor}" "$(base_name "${donor_ssid}" "${donor}" "${amp}" bin)" >&2
+			exit 1
+		}
+
+		suffix=${coeff_src##*.bin}
+		coeff_dst="$(base_name "${target_ssid}" "${spkid}" "${amp}" bin)${suffix}"
+		suffix=${wmfw_src##*.wmfw}
+		wmfw_dst="$(base_name "${target_ssid}" "${spkid}" "${amp}" wmfw)${suffix}"
+
+		install_alias "${wmfw_src}" "${wmfw_dst}" "${amp} WMFW alias"
+		install_alias "${coeff_src}" "${coeff_dst}" "${amp} coefficient alias (donor spkid${donor})"
+	done
 }
 
-restore_one() {
-	local amp=$1
-	local dst disabled kind
+restore_target() {
+	local file disabled found=0
 
-	for kind in coeff wmfw; do
-		case "${kind}" in
-			coeff) dst=$(coeff_file "${target_ssid}" "${target_spkid}" "${amp}") ;;
-			wmfw) dst=$(wmfw_file "${target_ssid}" "${target_spkid}" "${amp}") ;;
-		esac
-		disabled="${dst}.disabled-um3405ga-${stamp}"
+	while read -r file; do
+		[[ -n "${file}" ]] || continue
+		found=1
+		disabled="${file}.disabled-um3405ga-${stamp}"
+		mv "${file}" "${disabled}"
+		printf 'Disabled:\n  %s\n' "${disabled}"
+	done < <(find "${firmware_dir}" -maxdepth 1 \
+		-name "cs35l41-dsp1-spk-prot-${target_ssid}-*" \
+		! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' | sort)
 
-		if [[ ! -e "${dst}" ]]; then
-			printf 'No %s target to disable for %s:\n  %s\n' "${kind}" "${amp}" "${dst}"
-			continue
-		fi
-
-		mv "${dst}" "${disabled}"
-		printf 'Disabled %s %s target:\n  %s\n' "${amp}" "${kind}" "${disabled}"
-	done
+	if [[ "${found}" == "0" ]]; then
+		printf 'No %s firmware aliases to disable in %s\n' "${target_ssid}" "${firmware_dir}"
+	fi
 }
 
 find_alc294_card() {
@@ -134,10 +217,10 @@ find_alc294_card() {
 		return 0
 	fi
 
-	for codec in /proc/asound/card*/codec#0; do
+	for codec in /proc/asound/card*/codec#*; do
 		[[ -e "${codec}" ]] || continue
 		if grep -q '^Codec: Realtek ALC294$' "${codec}" &&
-			grep -qi '^Subsystem Id: 0x104319f4$' "${codec}"; then
+			grep -qi "^Subsystem Id: 0x${target_ssid}\$" "${codec}"; then
 			card=${codec#/proc/asound/card}
 			card=${card%%/*}
 			printf '%s\n' "${card}"
@@ -182,19 +265,39 @@ reload_firmware() {
 	fi
 }
 
-if [[ ! -d "${firmware_dir}" ]]; then
-	printf 'Missing firmware directory: %s\n' "${firmware_dir}" >&2
-	exit 1
+detected=''
+if [[ -z "${target_ssid}" || -z "${target_spkid}" ]]; then
+	detected=$(detect_ids || true)
+fi
+
+if [[ -n "${detected}" ]]; then
+	read -r detected_ssid detected_spkid <<<"${detected}"
+	target_ssid=${target_ssid:-${detected_ssid}}
+	target_spkid=${target_spkid:-${detected_spkid}}
+	printf 'Kernel log reports SSID %s, speaker ID %s.\n' "${detected_ssid}" "${detected_spkid}"
+else
+	target_ssid=${target_ssid:-${fallback_ssid}}
+fi
+
+declare -a variants=()
+if [[ -n "${target_spkid}" ]]; then
+	variants=("${target_spkid}")
+else
+	# Without a reading from the driver, cover every name it could ask for.
+	mapfile -t variants < <(donor_spkids)
+	variants+=(none)
+	printf 'Could not read the speaker ID from the kernel log; installing every variant (%s).\n' \
+		"${variants[*]}"
 fi
 
 case "${action}" in
 	install)
-		install_one l0
-		install_one r0
+		for variant in "${variants[@]}"; do
+			install_variant "${variant}"
+		done
 		;;
 	restore)
-		restore_one l0
-		restore_one r0
+		restore_target
 		;;
 esac
 
@@ -204,5 +307,5 @@ else
 	printf 'Could not auto-detect the UM3405GA ALC294 ALSA card; reboot to load the tuning.\n'
 fi
 
-printf '\nCheck the CS35L41 firmware log with:\n'
-printf '  journalctl -k -b --no-pager | grep -Ei %q\n' '104319f4|10431c03|falling back|Firmware Loaded|cs35l41'
+printf '\nStart at a low volume, then check the CS35L41 firmware log with:\n'
+printf '  journalctl -k -b --no-pager | grep -Ei %q\n' "${target_ssid}|${donor_ssid}|falling back|Firmware Loaded|cs35l41"
