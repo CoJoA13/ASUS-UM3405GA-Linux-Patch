@@ -9,8 +9,8 @@ set -euo pipefail
 # (104319f4) coefficient files. The CS35L41 HDA driver only requests
 # board-specific .bin coefficients after a board-specific .wmfw matches, so both
 # filenames have to exist before the borrowed tuning is used. linux-firmware
-# ships no board-specific WMFW for the donor either, so the generic
-# cs35l41-dsp1-spk-prot.wmfw is what gets aliased.
+# ships one real WMFW under several names, so either the generic
+# cs35l41-dsp1-spk-prot.wmfw or the donor's own is what gets aliased.
 #
 # Which names the driver asks for depends on the speaker-ID GPIO it reads at
 # probe time, so the requested IDs are taken from the kernel log when possible.
@@ -171,8 +171,15 @@ install_variant() {
 		exit 1
 	}
 
-	wmfw_src=$(resolve_file "${firmware_dir}/cs35l41-dsp1-spk-prot.wmfw") || {
-		printf 'Missing generic WMFW: %s/cs35l41-dsp1-spk-prot.wmfw\n' "${firmware_dir}" >&2
+	# linux-firmware ships one real WMFW and gives it a name per board, so a
+	# release may carry cs35l41-dsp1-spk-prot-<ssid>.wmfw without the bare
+	# generic name. The donor's own WMFW is that same firmware, so take it when
+	# the generic name is absent rather than refusing to install at all.
+	wmfw_src=$(resolve_file "${firmware_dir}/cs35l41-dsp1-spk-prot.wmfw") ||
+		wmfw_src=$(resolve_file "${firmware_dir}/cs35l41-dsp1-spk-prot-${donor_ssid}.wmfw") || {
+		printf 'No WMFW to alias: neither %s/cs35l41-dsp1-spk-prot.wmfw nor the %s variant exists.\n' \
+			"${firmware_dir}" "${donor_ssid}" >&2
+		printf 'Install the linux-firmware package that ships cirrus/cs35l41-dsp1-spk-prot*.wmfw.\n' >&2
 		exit 1
 	}
 
