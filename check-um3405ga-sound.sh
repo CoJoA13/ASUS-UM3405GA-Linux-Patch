@@ -108,7 +108,17 @@ prepare_report_file() {
 		return 1
 	fi
 
-	dir=$(dirname -- "${path}")
+	# Resolve the parent directory once, and use the resolved path from here on.
+	# A caller-owned symlink to a protected directory would otherwise pass the
+	# ownership check below -- stat reads the link, mktemp and mv follow it --
+	# and resolving once also means swapping the link afterwards changes nothing.
+	dir=$(cd -P -- "$(dirname -- "${path}")" 2>/dev/null && pwd -P) || {
+		printf 'Refusing to write the report to %s: cannot resolve its directory.\n' \
+			"${path}" >&2
+		return 1
+	}
+	path="${dir}/$(basename -- "${path}")"
+	report_file=${path}
 
 	# Under sudo the finished report is handed to the invoking user, so it must
 	# only ever land somewhere that user could already write. Without this, a
@@ -420,7 +430,13 @@ run_report() {
 				printf '%s\n' "${controls}" | sed 's/^/  /'
 			else
 				printf '  none (amixer failed, or the card exposes no matching controls)\n'
-				note 'No CS35L41/speaker controls on the ALC294 card; the amplifiers did not initialise'
+			fi
+
+			# Only the CS35L41's own "L0/R0 DSP1 Firmware" controls show the amps
+			# came up. Master/Speaker volume controls belong to the ALC294 and exist
+			# whether or not the amps initialised, so they prove nothing here.
+			if [[ "${controls}" != *'DSP1 Firmware'* ]]; then
+				note 'No CS35L41 "DSP1 Firmware" controls on the ALC294 card; the amplifiers did not initialise'
 			fi
 		else
 			printf 'No ALC294 card found; pass CARD=<n> to inspect a specific card.\n'
