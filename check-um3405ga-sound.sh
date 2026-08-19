@@ -95,13 +95,16 @@ if [[ "${pause}" == "auto" ]]; then
 	fi
 fi
 
-# The report is created as the invoking user, never as root. When this runs
-# under sudo the file work is dropped back to $SUDO_UID, so the kernel decides
+# Under sudo the file work is dropped back to $SUDO_UID, so the kernel decides
 # where the report may land: no ownership check of ours can be raced or fooled
-# by a swapped path component, because root never creates the file at all. That
-# also removes the need to chown it afterwards.
+# by a swapped path component, because root never creates the file at all.
 #
-# A staging directory plus a rename still guards the non-privileged case: the
+# Run from a root shell, su or doas there is no $SUDO_UID to drop to, and the
+# report really is created by root. dir_is_exclusive below is what keeps that
+# safe, so the two paths are not the same and this comment does not claim they
+# are.
+#
+# A staging directory plus a rename still guards the unprivileged case: the
 # destination name is predictable, and rename(2) replaces a symlink rather than
 # writing through one.
 as_user() {
@@ -144,6 +147,21 @@ stage_report() {
 	' um3405ga-report "$1"
 }
 
+# Can anyone but this directory's owner rename what is inside it? If they can,
+# they can swap our staging directory for a symlink between mktemp and the open
+# and choose where the file is created. That only matters when the file is
+# created by root, so it gates the privileged path alone; the sticky bit gives
+# /tmp the same protection by other means.
+dir_is_exclusive() {
+	local dir=$1 mode
+	mode=$(stat -Lc '%04a' -- "${dir}" 2>/dev/null) || return 1
+	[[ "${mode}" =~ ^[0-9]{4}$ ]] || return 1
+	((10#${mode:0:1} & 1)) && return 0
+	((10#${mode:2:1} & 2)) && return 1
+	((10#${mode:3:1} & 2)) && return 1
+	return 0
+}
+
 prepare_report_file() {
 	local path=$1
 	local dir tmpdir
@@ -161,6 +179,16 @@ prepare_report_file() {
 	fi
 
 	dir=$(dirname -- "${path}")
+
+	# Root with no $SUDO_UID: nothing to drop to, so refuse a directory whose
+	# path components another user could swap under us rather than create a
+	# root-owned file somewhere we did not choose.
+	if [[ "${EUID}" == "0" && -z "${SUDO_UID:-}" ]] && ! dir_is_exclusive "${dir}"; then
+		printf 'Refusing to write the report into %s as root: it is writable by other users.\n' "${dir}" >&2
+		printf 'Run this with sudo instead of from a root shell, or set REPORT_FILE to a directory only you can write.\n' >&2
+		return 1
+	fi
+
 	tmpdir=$(as_user mktemp -d -- "${dir}/.um3405ga-report.XXXXXX" 2>/dev/null) || return 1
 
 	report_tmp="${tmpdir}/report"
@@ -407,9 +435,13 @@ run_report() {
 	fi
 
 	section 'CS35L41 amplifiers'
-	if journalctl -k -b --no-pager >/dev/null 2>&1; then
+	# Gated on there being kernel records to read, not on the exit status: a
+	# caller outside the systemd-journal group gets an empty result and a zero
+	# exit, and treating that as a readable log turns "you may not look" into
+	# the false finding "the amps never bound".
+	klog=$(journalctl -k -b --no-pager 2>/dev/null)
+	if [[ -n "${klog}" ]]; then
 		journal_readable=1
-		klog=$(journalctl -k -b --no-pager 2>/dev/null)
 
 		bound=$(printf '%s\n' "${klog}" | grep -F 'CS35L41 Bound' | tail -4)
 		if [[ -n "${bound}" ]]; then
@@ -508,7 +540,9 @@ run_report() {
 			note 'DSP rejected coefficient blocks during at least one firmware load this boot (algorithm not in the loaded firmware); reboot and re-check to see the current state'
 		fi
 	else
-		printf 'Kernel log not readable; re-run as root for amplifier details.\n'
+		printf 'No kernel log entries readable, so the amplifier firmware state\n'
+		printf 'was not checked; re-run with sudo.\n'
+		note 'Kernel log not readable, so the amplifier firmware state could not be checked at all; re-run with sudo before trusting this summary'
 	fi
 
 	section 'ALSA amplifier controls'
@@ -648,10 +682,33 @@ run_report() {
 		for ssid in "${target_ssid}" "${donor_ssid}"; do
 			# Disabled and backup copies cannot satisfy the name the driver asks
 			# for, so listing them would misreport the tuning as installed.
-			mapfile -t matches < <(find "${firmware_dir}" -maxdepth 1 \
+			mapfile -t found < <(find "${firmware_dir}" -maxdepth 1 \
 				-name "cs35l41-dsp1-spk-prot-${ssid}*" \
 				! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' \
 				-printf '%f\n' 2>/dev/null | sort)
+
+			# The installer creates these as symlinks into linux-firmware, so a
+			# package update that drops the donor leaves the name in place and
+			# the target gone. -f and -s follow the link: an alias that resolves
+			# to nothing, to a directory, or to an empty file is a name the
+			# loader cannot use, and counting it is how a broken install reads
+			# as a healthy one.
+			matches=()
+			unusable=()
+			for entry in "${found[@]}"; do
+				if [[ -f "${firmware_dir}/${entry}" && -s "${firmware_dir}/${entry}" ]]; then
+					matches+=("${entry}")
+				else
+					unusable+=("${entry}")
+				fi
+			done
+
+			if [[ ${#unusable[@]} -gt 0 ]]; then
+				printf '%s: %s name(s) present but not loadable (dangling alias, empty or not a file):\n' \
+					"${ssid}" "${#unusable[@]}"
+				printf '  %s\n' "${unusable[@]}"
+			fi
+
 			if [[ ${#matches[@]} -gt 0 ]]; then
 				printf '%s:\n' "${ssid}"
 				printf '  %s\n' "${matches[@]}"
@@ -684,10 +741,15 @@ if [[ -n "${report_tmp}" ]]; then
 	run_report | stage_report "${report_tmp}"
 	tee_status=${PIPESTATUS[1]}
 
-	# rename(2) still resolves the staging name, so confirm afterwards that
-	# what landed at the destination is the regular file we wrote and not
-	# something a third party swapped in. Claiming a save that did not happen
-	# is worse than saying so.
+	# rename(2) resolves the staging name and -T anchors only the destination,
+	# so a third party who can write this directory can still swap the staging
+	# directory between the write and the move. Checking the destination
+	# afterwards catches a planted symlink but cannot catch a planted regular
+	# file: every check available here is another name lookup in the same
+	# directory, so it races the same way -- verified, not assumed. What does
+	# close it is refusing to be root in such a directory at all
+	# (dir_is_exclusive above); unprivileged, the attacker owns the
+	# destination name regardless of anything done here.
 	if [[ "${tee_status}" == "0" ]] &&
 		as_user mv -fT -- "${report_tmp}" "${report_file}" 2>/dev/null &&
 		[[ -f "${report_file}" && ! -L "${report_file}" ]]; then
