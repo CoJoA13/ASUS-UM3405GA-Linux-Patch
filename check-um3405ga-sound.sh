@@ -15,6 +15,7 @@ quirk_minor=2
 kernel=$(uname -r)
 problems=0
 notes=()
+detected_spkid=''
 report_file=${REPORT_FILE:-}
 report_tmp=''
 report_tmpdir=''
@@ -201,10 +202,20 @@ note() {
 # generic firmware if either is missing. Listing the files is not enough:
 # half a set looks installed and still leaves the speaker quiet.
 check_tuning_set() {
-	local ssid=$1 file name stem amp variant best=0 best_variant=''
+	local ssid=$1 file name stem amp variant prefix want orphans=''
+	local best=0 best_variant='' wanted_is=1
 	shift
 	local -A have_wmfw=() have_bin=() variants=()
-	local -a amp_list=()
+	local -a amp_list=() wanted=()
+
+	prefix="cs35l41-dsp1-spk-prot-${ssid}"
+	if [[ -n "${detected_spkid}" ]]; then
+		# Only these two names can be requested this boot: the speaker-ID
+		# variant read from the GPIO, and the bare name the driver falls back
+		# to. Files under any other variant are leftovers from an earlier
+		# install -- worth listing, not worth calling a fault.
+		wanted=("${prefix}-spkid${detected_spkid}" "${prefix}")
+	fi
 
 	for file in "$@"; do
 		# linux-firmware ships these compressed on most distributions and the
@@ -221,7 +232,7 @@ check_tuning_set() {
 
 	for stem in "${!have_wmfw[@]}"; do
 		if [[ -z "${have_bin[${stem}]:-}" ]]; then
-			note "${stem}.wmfw has no matching ${stem}.bin, so that amp falls back to the generic (quiet) firmware"
+			orphans+=" ${stem}.wmfw"
 			continue
 		fi
 		# The driver requests one speaker-ID variant, so both amps have to be
@@ -234,11 +245,23 @@ check_tuning_set() {
 	done
 
 	for stem in "${!have_bin[@]}"; do
-		[[ -n "${have_wmfw[${stem}]:-}" ]] ||
-			note "${stem}.bin has no matching ${stem}.wmfw, so that amp falls back to the generic (quiet) firmware"
+		[[ -n "${have_wmfw[${stem}]:-}" ]] || orphans+=" ${stem}.bin"
 	done
 
+	# Printed, not raised: whether an unpaired file matters depends entirely on
+	# whether the driver asks for its variant, and the check below already
+	# decides that.
+	[[ -n "${orphans}" ]] &&
+		printf '  incomplete, missing their pair:%s\n' "${orphans}"
+
 	for variant in "${!variants[@]}"; do
+		if [[ ${#wanted[@]} -gt 0 ]]; then
+			wanted_is=0
+			for want in "${wanted[@]}"; do
+				[[ "${variant}" == "${want}" ]] && wanted_is=1
+			done
+			[[ "${wanted_is}" == "1" ]] || continue
+		fi
 		read -r -a amp_list <<<"${variants[${variant}]}"
 		if [[ ${#amp_list[@]} -gt ${best} ]]; then
 			best=${#amp_list[@]}
@@ -246,12 +269,18 @@ check_tuning_set() {
 		fi
 	done
 
-	if [[ "${best}" -lt 2 ]]; then
-		if [[ "${best}" == "0" ]]; then
-			note "No complete ${ssid} tuning pair (.wmfw plus .bin) is installed for either amp; reinstall with install-um3405ga-cs35l41-tuning.sh install"
+	if [[ "${best}" -ge 2 ]]; then
+		return 0
+	fi
+
+	if [[ "${best}" == "0" ]]; then
+		if [[ -n "${detected_spkid}" ]]; then
+			note "No complete ${ssid} tuning pair (.wmfw plus .bin) is installed under the name this boot asks for (spkid${detected_spkid}, or the bare ${ssid}), so both amps fall back to the generic (quiet) firmware; reinstall with install-um3405ga-cs35l41-tuning.sh install"
 		else
-			note "No ${ssid} variant covers both amps: the most complete one (${best_variant}) has only${variants[${best_variant}]}; the driver requests a single variant, so reinstall with install-um3405ga-cs35l41-tuning.sh install"
+			note "No complete ${ssid} tuning pair (.wmfw plus .bin) is installed for either amp; reinstall with install-um3405ga-cs35l41-tuning.sh install"
 		fi
+	else
+		note "${best_variant} covers only${variants[${best_variant}]}; the driver requests a single variant, so the other amp falls back to the generic (quiet) firmware -- reinstall with install-um3405ga-cs35l41-tuning.sh install"
 	fi
 }
 
@@ -377,6 +406,11 @@ run_report() {
 		bound=$(printf '%s\n' "${klog}" | grep -F 'CS35L41 Bound' | tail -4)
 		if [[ -n "${bound}" ]]; then
 			printf '%s\n' "${bound}" | sed 's/^.*cs35l41-hda/cs35l41-hda/'
+			# The speaker ID is read from a GPIO at probe and decides which
+			# firmware variant the driver asks for, so the inventory below can
+			# tell the requested tuning from leftovers of another variant.
+			spkid_re='SPKID: ([0-9]+)'
+			[[ "${bound}" =~ ${spkid_re} ]] && detected_spkid=${BASH_REMATCH[1]}
 		else
 			printf 'No "CS35L41 Bound" lines in this boot; the amps never bound.\n'
 			note 'CS35L41 amps did not bind this boot'
@@ -492,9 +526,18 @@ run_report() {
 			# blank section followed by "no problems detected".
 			controls=$(amixer -c "${ctl_card}" contents 2>/dev/null |
 				grep -A2 -iE "name='.*(DSP1 Firmware|Speaker|Gain|Boost|Master)" |
-				grep -viE '^--$' | head -60)
+				grep -viE '^--$')
 			if [[ -n "${controls}" ]]; then
-				printf '%s\n' "${controls}" | sed 's/^/  /'
+				# Truncate what is printed, never what is parsed: the
+				# firmware-load controls are indexed after the volume controls
+				# on this card, so a capped dump could hide the very controls
+				# the check below looks for and report the amps as absent.
+				control_lines=$(printf '%s\n' "${controls}" | wc -l)
+				printf '%s\n' "${controls}" | head -60 | sed 's/^/  /'
+				if [[ "${control_lines}" -gt 60 ]]; then
+					printf '  ... %s more line(s) not shown; all of them were checked\n' \
+						"$((control_lines - 60))"
+				fi
 			else
 				printf '  none (amixer failed, or the card exposes no matching controls)\n'
 			fi
@@ -549,6 +592,7 @@ run_report() {
 		fi
 	else
 		printf 'amixer not installed (apt install alsa-utils).\n'
+		note 'amixer is not installed, so the amplifiers were not checked at all; install alsa-utils and re-run before trusting this summary'
 	fi
 
 	section 'Previous boots'
