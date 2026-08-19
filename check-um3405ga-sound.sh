@@ -30,7 +30,8 @@ Writes the report to the terminal and to a file. Double-clicking this script
 from a file manager also works: the window is held open until you press Enter.
 
 Environment overrides:
-  REPORT_FILE=<path>   (default: ./um3405ga-sound-report.txt, or \$HOME if unwritable)
+  REPORT_FILE=<path>   (default: ./um3405ga-sound-report.txt, falling back to
+                       your home directory and then /tmp if that is unwritable)
   PAUSE=auto|1|0
   TARGET_SSID=${target_ssid}
   DONOR_SSID=${donor_ssid}
@@ -103,11 +104,42 @@ fi
 # writing through one.
 as_user() {
 	if [[ -n "${SUDO_UID:-}" ]] && command -v setpriv >/dev/null 2>&1; then
+		# --init-groups, not --clear-groups: a home or project directory is
+		# often writable through a supplementary group, and dropping those
+		# would refuse a directory the invoking user can plainly write.
 		setpriv --reuid="${SUDO_UID}" --regid="${SUDO_GID:-${SUDO_UID}}" \
-			--clear-groups -- "$@"
+			--init-groups -- "$@"
 	else
 		"$@"
 	fi
+}
+
+# $HOME still names root's home under sudo, and root's home is exactly where
+# the invoking user cannot write. Ask the password database instead.
+invoking_home() {
+	local home=''
+	if [[ -n "${SUDO_UID:-}" ]] && command -v getent >/dev/null 2>&1; then
+		home=$(getent passwd "${SUDO_UID}" 2>/dev/null |
+			awk -F: 'NR == 1 { print $6 }')
+	fi
+	[[ -n "${home}" ]] || home=${HOME:-}
+	printf '%s' "${home}"
+}
+
+# The staging write is bound to the inode this opens, not to its name. Another
+# user who can rename the staging directory could otherwise leave a symlink
+# where the write expects to reopen the file, and tee would follow it into
+# whatever the invoking user owns. noclobber gives the create O_EXCL
+# semantics, which refuses an existing name of any kind, and tee then writes
+# through the descriptor. umask makes it 0600 from the start: the report
+# quotes the kernel log, which may be root-only.
+stage_report() {
+	as_user "${BASH:-/bin/bash}" -c '
+		set -o noclobber
+		umask 077
+		exec 3>"$1" || exit 1
+		exec tee --output-error=warn-nopipe -- /dev/fd/3
+	' um3405ga-report "$1"
 }
 
 prepare_report_file() {
@@ -140,8 +172,12 @@ if [[ -n "${report_file}" ]]; then
 else
 	report_file="${PWD}/um3405ga-sound-report.txt"
 	if ! prepare_report_file "${report_file}"; then
-		report_file="${HOME:-/tmp}/um3405ga-sound-report.txt"
-		prepare_report_file "${report_file}" || report_file=''
+		for report_dir in "$(invoking_home)" /tmp; do
+			[[ -n "${report_dir}" ]] || continue
+			report_file="${report_dir}/um3405ga-sound-report.txt"
+			prepare_report_file "${report_file}" && break
+			report_file=''
+		done
 	fi
 fi
 
@@ -159,6 +195,40 @@ section() {
 note() {
 	notes+=("$1")
 	problems=$((problems + 1))
+}
+
+# The driver asks for a .wmfw and a .bin per amp, and it falls back to the
+# generic firmware if either is missing. Listing the files is not enough:
+# half a set looks installed and still leaves the speaker quiet.
+check_tuning_set() {
+	local ssid=$1 file stem amp
+	shift
+	local -A have_wmfw=() have_bin=() amps=()
+
+	for file in "$@"; do
+		case "${file}" in
+			*.wmfw) have_wmfw["${file%.wmfw}"]=1 ;;
+			*.bin) have_bin["${file%.bin}"]=1 ;;
+		esac
+	done
+
+	for stem in "${!have_wmfw[@]}"; do
+		if [[ -z "${have_bin[${stem}]:-}" ]]; then
+			note "${stem}.wmfw has no matching ${stem}.bin, so that amp falls back to the generic (quiet) firmware"
+			continue
+		fi
+		amp=${stem##*-}
+		amps["${amp}"]=1
+	done
+
+	for stem in "${!have_bin[@]}"; do
+		[[ -n "${have_wmfw[${stem}]:-}" ]] ||
+			note "${stem}.bin has no matching ${stem}.wmfw, so that amp falls back to the generic (quiet) firmware"
+	done
+
+	if [[ ${#amps[@]} -lt 2 ]]; then
+		note "Complete ${ssid} tuning pairs are installed for only ${#amps[@]} of the 2 amps; reinstall with install-um3405ga-cs35l41-tuning.sh install"
+	fi
 }
 
 # 1043:19f4 and 1043:1c03 as stored little-endian in struct snd_pci_quirk.
@@ -500,6 +570,8 @@ run_report() {
 			if [[ ${#matches[@]} -gt 0 ]]; then
 				printf '%s:\n' "${ssid}"
 				printf '  %s\n' "${matches[@]}"
+				[[ "${ssid}" == "${target_ssid}" ]] &&
+					check_tuning_set "${ssid}" "${matches[@]}"
 			else
 				printf '%s: none installed\n' "${ssid}"
 				if [[ "${ssid}" == "${target_ssid}" ]]; then
@@ -521,20 +593,22 @@ run_report() {
 }
 
 if [[ -n "${report_tmp}" ]]; then
-	# tee runs as the invoking user, so the write is bounded by their own
-	# permissions. --output-error=warn-nopipe keeps the file complete when a
-	# downstream consumer such as head exits early.
-	run_report | as_user tee --output-error=warn-nopipe -- "${report_tmp}"
+	# The staging write runs as the invoking user, so it is bounded by their
+	# own permissions. --output-error=warn-nopipe keeps the file complete when
+	# a downstream consumer such as head exits early.
+	run_report | stage_report "${report_tmp}"
 	tee_status=${PIPESTATUS[1]}
 
-	# The report quotes the kernel log, which may be root-only, so keep it
-	# readable only by its owner.
+	# rename(2) still resolves the staging name, so confirm afterwards that
+	# what landed at the destination is the regular file we wrote and not
+	# something a third party swapped in. Claiming a save that did not happen
+	# is worse than saying so.
 	if [[ "${tee_status}" == "0" ]] &&
-		as_user chmod 0600 -- "${report_tmp}" 2>/dev/null &&
-		as_user mv -fT -- "${report_tmp}" "${report_file}" 2>/dev/null; then
+		as_user mv -fT -- "${report_tmp}" "${report_file}" 2>/dev/null &&
+		[[ -f "${report_file}" && ! -L "${report_file}" ]]; then
 		printf '\nSaved this report to:\n  %s\n' "${report_file}"
 	else
-		printf '\nFailed to save the report to %s (tee exited %s).\n' \
+		printf '\nFailed to save the report to %s (write exited %s).\n' \
 			"${report_file}" "${tee_status}" >&2
 		printf 'The report above is complete.\n' >&2
 		exit_status=1
