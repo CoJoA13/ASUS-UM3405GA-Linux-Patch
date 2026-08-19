@@ -16,7 +16,9 @@ kernel=$(uname -r)
 problems=0
 notes=()
 report_file=${REPORT_FILE:-}
+report_tmp=''
 pause=${PAUSE:-auto}
+exit_status=0
 
 usage() {
 	cat <<EOF
@@ -89,27 +91,38 @@ if [[ "${pause}" == "auto" ]]; then
 fi
 
 # The report name is predictable and this script may be run with sudo from a
-# directory other users can write to, so never write through a planted symlink
-# or into anything that is not a plain file.
+# directory other users can write to. Refuse anything that is not a plain file,
+# then write to a mktemp sibling and rename it into place: rename(2) replaces a
+# symlink rather than following it, so there is no window in which the report
+# can be redirected through one.
 prepare_report_file() {
 	local path=$1
+	local tmp
 
 	if [[ -L "${path}" || ( -e "${path}" && ! -f "${path}" ) ]]; then
 		printf 'Refusing to write the report to %s: not a regular file.\n' "${path}" >&2
 		return 1
 	fi
 
-	: >"${path}" 2>/dev/null
+	tmp=$(mktemp -- "${path}.XXXXXX" 2>/dev/null) || return 1
+	printf '%s\n' "${tmp}"
 }
 
-if [[ -z "${report_file}" ]]; then
+if [[ -n "${report_file}" ]]; then
+	report_tmp=$(prepare_report_file "${report_file}") || report_file=''
+else
 	report_file="${PWD}/um3405ga-sound-report.txt"
-	if ! prepare_report_file "${report_file}"; then
+	if ! report_tmp=$(prepare_report_file "${report_file}"); then
 		report_file="${HOME:-/tmp}/um3405ga-sound-report.txt"
-		prepare_report_file "${report_file}" || report_file=''
+		report_tmp=$(prepare_report_file "${report_file}") || report_file=''
 	fi
-elif ! prepare_report_file "${report_file}"; then
-	report_file=''
+fi
+
+if [[ -n "${report_tmp}" ]]; then
+	trap 'rm -f -- "${report_tmp}"' EXIT
+else
+	printf 'Could not create a report file; printing to the terminal only.\n' >&2
+	exit_status=1
 fi
 
 section() {
@@ -281,17 +294,17 @@ run_report() {
 	fi
 }
 
-exit_status=0
-
-if [[ -n "${report_file}" ]]; then
-	run_report | tee -- "${report_file}"
+if [[ -n "${report_tmp}" ]]; then
+	run_report | tee -- "${report_tmp}"
 	tee_status=${PIPESTATUS[1]}
-	if [[ "${tee_status}" == "0" ]]; then
+	if [[ "${tee_status}" == "0" ]] &&
+		chmod 0644 -- "${report_tmp}" 2>/dev/null &&
+		mv -f -- "${report_tmp}" "${report_file}" 2>/dev/null; then
 		printf '\nSaved this report to:\n  %s\n' "${report_file}"
 	else
-		printf '\nFailed to write the report to %s (tee exited %s).\n' \
+		printf '\nFailed to save the report to %s (tee exited %s).\n' \
 			"${report_file}" "${tee_status}" >&2
-		printf 'The report above is complete; the saved copy may be truncated.\n' >&2
+		printf 'The report above is complete.\n' >&2
 		exit_status=1
 	fi
 else
