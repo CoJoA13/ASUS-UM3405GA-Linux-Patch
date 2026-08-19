@@ -435,8 +435,33 @@ run_report() {
 			# Only the CS35L41's own "L0/R0 DSP1 Firmware" controls show the amps
 			# came up. Master/Speaker volume controls belong to the ALC294 and exist
 			# whether or not the amps initialised, so they prove nothing here.
-			if [[ "${controls}" != *'DSP1 Firmware'* ]]; then
+			#
+			# Presence is not enough either: a "Firmware Load" control left off (an
+			# interrupted live reload, say) still appears in the dump while the DSP
+			# runs untuned, and the boot journal keeps its earlier "Firmware Loaded"
+			# line either way. Read the values.
+			fw_ctl_found=0
+			fw_ctl_off=''
+			ctl_name=''
+			ctl_name_re="name='([^']*DSP1 Firmware[^']*)'"
+			while IFS= read -r ctl_line; do
+				if [[ "${ctl_line}" =~ ${ctl_name_re} ]]; then
+					fw_ctl_found=1
+					ctl_name=${BASH_REMATCH[1]}
+					[[ "${ctl_name}" == *'Firmware Load'* ]] || ctl_name=''
+					continue
+				fi
+				if [[ -n "${ctl_name}" && "${ctl_line}" =~ ^[[:space:]]*:[[:space:]]*values=(.*)$ ]]; then
+					[[ "${BASH_REMATCH[1]}" == *off* ]] && fw_ctl_off+=" ${ctl_name}"
+					ctl_name=''
+				fi
+			done <<<"${controls}"
+
+			if [[ "${fw_ctl_found}" == "0" ]]; then
 				note 'No CS35L41 "DSP1 Firmware" controls on the ALC294 card; the amplifiers did not initialise'
+			elif [[ -n "${fw_ctl_off}" ]]; then
+				printf '  DSP firmware load is currently OFF on:%s\n' "${fw_ctl_off}"
+				note 'CS35L41 DSP firmware load is switched off; those amps are running untuned regardless of what the boot log says'
 			fi
 		else
 			printf 'No ALC294 card found; pass CARD=<n> to inspect a specific card.\n'
@@ -480,13 +505,20 @@ run_report() {
 	section 'CS35L41 firmware files'
 	if [[ -d "${firmware_dir}" ]]; then
 		for ssid in "${target_ssid}" "${donor_ssid}"; do
+			# Disabled and backup copies cannot satisfy the name the driver asks
+			# for, so listing them would misreport the tuning as installed.
 			mapfile -t matches < <(find "${firmware_dir}" -maxdepth 1 \
-				-name "cs35l41-dsp1-spk-prot-${ssid}*" -printf '%f\n' 2>/dev/null | sort)
+				-name "cs35l41-dsp1-spk-prot-${ssid}*" \
+				! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' \
+				-printf '%f\n' 2>/dev/null | sort)
 			if [[ ${#matches[@]} -gt 0 ]]; then
 				printf '%s:\n' "${ssid}"
 				printf '  %s\n' "${matches[@]}"
 			else
 				printf '%s: none installed\n' "${ssid}"
+				if [[ "${ssid}" == "${target_ssid}" ]]; then
+					note "No ${target_ssid} tuning files installed, so the amps can only fall back to the generic (quiet) firmware; run install-um3405ga-cs35l41-tuning.sh install"
+				fi
 			fi
 		done
 	else
