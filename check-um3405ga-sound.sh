@@ -201,14 +201,21 @@ note() {
 # generic firmware if either is missing. Listing the files is not enough:
 # half a set looks installed and still leaves the speaker quiet.
 check_tuning_set() {
-	local ssid=$1 file stem amp
+	local ssid=$1 file name stem amp variant best=0 best_variant=''
 	shift
-	local -A have_wmfw=() have_bin=() amps=()
+	local -A have_wmfw=() have_bin=() variants=()
+	local -a amp_list=()
 
 	for file in "$@"; do
-		case "${file}" in
-			*.wmfw) have_wmfw["${file%.wmfw}"]=1 ;;
-			*.bin) have_bin["${file%.bin}"]=1 ;;
+		# linux-firmware ships these compressed on most distributions and the
+		# installer keeps whatever compression the donor used, so .wmfw.zst
+		# and .bin.xz are ordinary complete installs, not stray files.
+		name=${file%.zst}
+		name=${name%.xz}
+		name=${name%.gz}
+		case "${name}" in
+			*.wmfw) have_wmfw["${name%.wmfw}"]=1 ;;
+			*.bin) have_bin["${name%.bin}"]=1 ;;
 		esac
 	done
 
@@ -217,8 +224,13 @@ check_tuning_set() {
 			note "${stem}.wmfw has no matching ${stem}.bin, so that amp falls back to the generic (quiet) firmware"
 			continue
 		fi
+		# The driver requests one speaker-ID variant, so both amps have to be
+		# complete within that same variant. An L0 pair from spkid0 and an R0
+		# pair from spkid1 covers both amps on paper and satisfies neither
+		# request.
+		variant=${stem%-*}
 		amp=${stem##*-}
-		amps["${amp}"]=1
+		variants["${variant}"]+=" ${amp}"
 	done
 
 	for stem in "${!have_bin[@]}"; do
@@ -226,8 +238,20 @@ check_tuning_set() {
 			note "${stem}.bin has no matching ${stem}.wmfw, so that amp falls back to the generic (quiet) firmware"
 	done
 
-	if [[ ${#amps[@]} -lt 2 ]]; then
-		note "Complete ${ssid} tuning pairs are installed for only ${#amps[@]} of the 2 amps; reinstall with install-um3405ga-cs35l41-tuning.sh install"
+	for variant in "${!variants[@]}"; do
+		read -r -a amp_list <<<"${variants[${variant}]}"
+		if [[ ${#amp_list[@]} -gt ${best} ]]; then
+			best=${#amp_list[@]}
+			best_variant=${variant}
+		fi
+	done
+
+	if [[ "${best}" -lt 2 ]]; then
+		if [[ "${best}" == "0" ]]; then
+			note "No complete ${ssid} tuning pair (.wmfw plus .bin) is installed for either amp; reinstall with install-um3405ga-cs35l41-tuning.sh install"
+		else
+			note "No ${ssid} variant covers both amps: the most complete one (${best_variant}) has only${variants[${best_variant}]}; the driver requests a single variant, so reinstall with install-um3405ga-cs35l41-tuning.sh install"
+		fi
 	fi
 }
 
