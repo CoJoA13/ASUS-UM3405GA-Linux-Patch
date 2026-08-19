@@ -268,10 +268,13 @@ run_report() {
 			note 'CS35L41 amps did not bind this boot'
 		fi
 
-		if printf '%s\n' "${klog}" | grep -qF 'Falling back to default firmware'; then
+		# Matched in-shell rather than through `| grep -q`: grep exits on the
+		# first hit, the writer takes SIGPIPE, and pipefail then reports 141 for a
+		# pipeline that did match, silently dropping these findings.
+		if [[ "${klog}" == *'Falling back to default firmware'* ]]; then
 			printf 'DSP firmware: generic fallback in use (speakers will be quiet).\n'
 			note 'CS35L41 fell back to generic firmware; the board tuning was not requested or not found'
-		elif printf '%s\n' "${klog}" | grep -qF 'Firmware Loaded'; then
+		elif [[ "${klog}" == *'Firmware Loaded'* ]]; then
 			printf 'DSP firmware: board tuning loaded.\n'
 		fi
 
@@ -286,7 +289,8 @@ run_report() {
 			printf '%s\n' "${detail}" | sed 's/^.*\] //'
 		fi
 
-		if printf '%s\n' "${klog}" | grep -qE 'No .* for algorithm'; then
+		alg_reject_re='No [^ ]+ for algorithm'
+		if [[ "${klog}" =~ ${alg_reject_re} ]]; then
 			note 'DSP rejected coefficient blocks (algorithm not in the loaded firmware); the borrowed tuning is not fully applied'
 		fi
 	else
@@ -310,8 +314,8 @@ run_report() {
 		if [[ -n "${ctl_card}" ]]; then
 			printf 'Card %s:\n' "${ctl_card}"
 			amixer -c "${ctl_card}" contents 2>/dev/null |
-				grep -A1 -iE "name='.*(DSP1 Firmware|Speaker|Gain|Boost|Master)" |
-				grep -viE '^--$' | sed 's/^/  /' | head -40
+				grep -A2 -iE "name='.*(DSP1 Firmware|Speaker|Gain|Boost|Master)" |
+				grep -viE '^--$' | sed 's/^/  /' | head -60
 		else
 			printf 'No ALC294 card found; pass CARD=<n> to inspect a specific card.\n'
 		fi
