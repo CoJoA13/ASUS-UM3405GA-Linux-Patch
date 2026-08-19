@@ -16,6 +16,7 @@ kernel=$(uname -r)
 problems=0
 notes=()
 detected_spkid=''
+journal_readable=0
 report_file=${REPORT_FILE:-}
 report_tmp=''
 report_tmpdir=''
@@ -203,18 +204,24 @@ note() {
 # half a set looks installed and still leaves the speaker quiet.
 check_tuning_set() {
 	local ssid=$1 file name stem amp variant prefix want orphans=''
-	local best=0 best_variant='' wanted_is=1
+	local best=0 best_variant='' wanted_is=1 wanted_desc=''
 	shift
 	local -A have_wmfw=() have_bin=() variants=()
 	local -a amp_list=() wanted=()
 
 	prefix="cs35l41-dsp1-spk-prot-${ssid}"
-	if [[ -n "${detected_spkid}" ]]; then
+	if [[ "${detected_spkid}" == "none" ]]; then
+		# No speaker-ID GPIO: the bare name is the only one requested, and a
+		# spkid set installed alongside it is never looked at.
+		wanted=("${prefix}")
+		wanted_desc="the bare ${ssid} name, which is all this machine asks for (it reports no speaker-ID GPIO)"
+	elif [[ -n "${detected_spkid}" ]]; then
 		# Only these two names can be requested this boot: the speaker-ID
 		# variant read from the GPIO, and the bare name the driver falls back
 		# to. Files under any other variant are leftovers from an earlier
 		# install -- worth listing, not worth calling a fault.
 		wanted=("${prefix}-spkid${detected_spkid}" "${prefix}")
+		wanted_desc="the names this boot asks for (spkid${detected_spkid}, or the bare ${ssid})"
 	fi
 
 	for file in "$@"; do
@@ -274,8 +281,8 @@ check_tuning_set() {
 	fi
 
 	if [[ "${best}" == "0" ]]; then
-		if [[ -n "${detected_spkid}" ]]; then
-			note "No complete ${ssid} tuning pair (.wmfw plus .bin) is installed under the name this boot asks for (spkid${detected_spkid}, or the bare ${ssid}), so both amps fall back to the generic (quiet) firmware; reinstall with install-um3405ga-cs35l41-tuning.sh install"
+		if [[ -n "${wanted_desc}" ]]; then
+			note "No complete ${ssid} tuning pair (.wmfw plus .bin) is installed under ${wanted_desc}, so both amps fall back to the generic (quiet) firmware; reinstall with install-um3405ga-cs35l41-tuning.sh install"
 		else
 			note "No complete ${ssid} tuning pair (.wmfw plus .bin) is installed for either amp; reinstall with install-um3405ga-cs35l41-tuning.sh install"
 		fi
@@ -401,6 +408,7 @@ run_report() {
 
 	section 'CS35L41 amplifiers'
 	if journalctl -k -b --no-pager >/dev/null 2>&1; then
+		journal_readable=1
 		klog=$(journalctl -k -b --no-pager 2>/dev/null)
 
 		bound=$(printf '%s\n' "${klog}" | grep -F 'CS35L41 Bound' | tail -4)
@@ -408,9 +416,15 @@ run_report() {
 			printf '%s\n' "${bound}" | sed 's/^.*cs35l41-hda/cs35l41-hda/'
 			# The speaker ID is read from a GPIO at probe and decides which
 			# firmware variant the driver asks for, so the inventory below can
-			# tell the requested tuning from leftovers of another variant.
-			spkid_re='SPKID: ([0-9]+)'
-			[[ "${bound}" =~ ${spkid_re} ]] && detected_spkid=${BASH_REMATCH[1]}
+			# tell the requested tuning from leftovers of another variant. A
+			# negative ID means there is no such GPIO and the driver asks for
+			# filenames with no spkid component at all, which is what
+			# install-um3405ga-cs35l41-tuning.sh calls "none".
+			spkid_re='SPKID: (-?[0-9]+)'
+			if [[ "${bound}" =~ ${spkid_re} ]]; then
+				detected_spkid=${BASH_REMATCH[1]}
+				((detected_spkid < 0)) && detected_spkid=none
+			fi
 		else
 			printf 'No "CS35L41 Bound" lines in this boot; the amps never bound.\n'
 			note 'CS35L41 amps did not bind this boot'
@@ -598,7 +612,10 @@ run_report() {
 	section 'Previous boots'
 	# A hard reset leaves no clean shutdown, so an unexpectedly ended boot with
 	# an oops or hung task in it is worth surfacing here.
-	if journalctl -k -b -1 --no-pager >/dev/null 2>&1; then
+	if [[ "${journal_readable}" != "1" ]]; then
+		printf 'Kernel log not readable, so earlier boots were not checked at all;\n'
+		printf 're-run as root. This is not the same as there being none.\n'
+	elif journalctl -k -b -1 --no-pager >/dev/null 2>&1; then
 		for prev in -1 -2; do
 			if ! journalctl -k -b "${prev}" --no-pager >/dev/null 2>&1; then
 				printf 'boot %s: not in the journal\n' "${prev}"
