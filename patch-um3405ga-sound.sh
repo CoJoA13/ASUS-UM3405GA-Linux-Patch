@@ -5,12 +5,22 @@ set -euo pipefail
 # f61bc797ac00 ("ALSA: hda/realtek: Add CS35L41 I2C quirk for ASUS UM3405GA").
 #
 # The upstream fix adds 1043:19f4 with the same fixup as the already-present
-# ASUS UM3406HA 1043:1c03 entry. For installed binary modules, replace that
-# one subsystem ID in snd-hda-codec-alc269.ko.zst and rebuild module metadata.
+# ASUS UM3406HA 1043:1c03 entry. Growing the quirk table in a compiled module is
+# not practical, so this repoints that one subsystem ID in
+# snd-hda-codec-alc269.ko.zst and rebuilds module metadata. The patched module
+# therefore drives the UM3405GA instead of the UM3406HA.
+#
+# Kernels from Linux 7.2 onward carry the quirk already and are left untouched;
+# prefer install-ubuntu-mainline-kernel.sh over this workaround.
 
 old_id=$'\x43\x10\x03\x1c' # 1043:1c03, ASUS UM3406HA
 new_id=$'\x43\x10\xf4\x19' # 1043:19f4, ASUS UM3405GA
-module_relpath='kernel/sound/hda/codecs/realtek/snd-hda-codec-alc269.ko.zst'
+# Linux 6.17 split the Realtek codec module out of snd-hda-codec-realtek; older
+# kernels still use the old path, and distros compress modules differently.
+module_relpaths=(
+	'kernel/sound/hda/codecs/realtek/snd-hda-codec-alc269.ko'
+	'kernel/sound/pci/hda/snd-hda-codec-realtek.ko'
+)
 modprobe_conf='/etc/modprobe.d/um3405ga-sound.conf'
 softdep_line='softdep snd_hda_intel pre: snd_hda_codec_alc269 snd_hda_scodec_cs35l41_i2c'
 rebind_src='./rebind-um3405ga-sound.sh'
@@ -22,7 +32,7 @@ if [[ ${EUID} -ne 0 ]]; then
 	exit 1
 fi
 
-for tool in perl zstd depmod; do
+for tool in perl depmod; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		printf 'Missing required tool: %s\n' "$tool" >&2
 		exit 1
@@ -81,28 +91,76 @@ refresh_kernel_metadata() {
 	fi
 }
 
+find_module() {
+	local kernel=$1
+	local relpath suffix
+
+	for relpath in "${module_relpaths[@]}"; do
+		for suffix in .zst .xz .gz ''; do
+			if [[ -f "/lib/modules/${kernel}/${relpath}${suffix}" ]]; then
+				printf '%s\n' "/lib/modules/${kernel}/${relpath}${suffix}"
+				return 0
+			fi
+		done
+	done
+
+	return 1
+}
+
+decompress_module() {
+	local src=$1 dst=$2
+
+	case "${src}" in
+		*.zst) zstd -q -dc "${src}" >"${dst}" ;;
+		*.xz) xz -dc "${src}" >"${dst}" ;;
+		*.gz) gzip -dc "${src}" >"${dst}" ;;
+		*) cp "${src}" "${dst}" ;;
+	esac
+}
+
+compress_module() {
+	local src=$1 dst=$2
+
+	case "${dst}" in
+		*.zst) zstd -q -19 -f "${src}" -o "${dst}" ;;
+		*.xz) xz -c "${src}" >"${dst}" ;;
+		*.gz) gzip -c "${src}" >"${dst}" ;;
+		*) cp "${src}" "${dst}" ;;
+	esac
+}
+
 patch_kernel() {
 	local kernel=$1
-	local module="/lib/modules/${kernel}/${module_relpath}"
+	local module raw packed
 	local tmpdir old_count new_count backup sig_state install_reason
 
-	if [[ ! -f "${module}" ]]; then
-		printf 'Skipping %s: module not found\n' "$kernel"
+	if ! module=$(find_module "${kernel}"); then
+		printf 'Skipping %s: Realtek codec module not found\n' "$kernel"
 		return 0
 	fi
 
 	tmpdir=$(mktemp -d)
 	trap 'rm -rf "${tmpdir}"' RETURN
+	raw="${tmpdir}/module.ko"
+	packed="${tmpdir}/$(basename "${module}")"
 
-	zstd -q -dc "${module}" >"${tmpdir}/snd-hda-codec-alc269.ko"
+	if ! decompress_module "${module}" "${raw}"; then
+		printf 'Could not read %s\n' "${module}" >&2
+		return 1
+	fi
 
-	old_count=$(count_bytes "$old_id" "${tmpdir}/snd-hda-codec-alc269.ko")
-	new_count=$(count_bytes "$new_id" "${tmpdir}/snd-hda-codec-alc269.ko")
+	old_count=$(count_bytes "$old_id" "${raw}")
+	new_count=$(count_bytes "$new_id" "${raw}")
 	install_reason=''
 
-	if [[ "${new_count}" == "1" ]]; then
-		printf '%s: UM3405GA quirk is already present\n' "$kernel"
-		sig_state=$(strip_module_signature "${tmpdir}/snd-hda-codec-alc269.ko")
+	if [[ "${new_count}" != "0" && "${old_count}" != "0" ]]; then
+		# Both IDs present means this kernel ships the upstream quirk. Leave the
+		# distro module (and its signature) alone.
+		printf '%s: ships the upstream UM3405GA quirk; nothing to patch\n' "$kernel"
+		return 0
+	elif [[ "${new_count}" == "1" ]]; then
+		printf '%s: UM3405GA quirk was already patched in\n' "$kernel"
+		sig_state=$(strip_module_signature "${raw}")
 		if [[ "${sig_state}" == "stripped" ]]; then
 			install_reason='stripped stale module signature'
 		fi
@@ -111,17 +169,17 @@ patch_kernel() {
 			my $old = $ENV{"PATTERN_OLD"};
 			my $new = $ENV{"PATTERN_NEW"};
 			s/\Q$old\E/$new/g;
-		' "${tmpdir}/snd-hda-codec-alc269.ko"
+		' "${raw}"
 
-		old_count=$(count_bytes "$old_id" "${tmpdir}/snd-hda-codec-alc269.ko")
-		new_count=$(count_bytes "$new_id" "${tmpdir}/snd-hda-codec-alc269.ko")
+		old_count=$(count_bytes "$old_id" "${raw}")
+		new_count=$(count_bytes "$new_id" "${raw}")
 
 		if [[ "${old_count}" != "0" || "${new_count}" != "1" ]]; then
 			printf 'Patch verification failed for %s: old=%s new=%s\n' "$kernel" "$old_count" "$new_count" >&2
 			return 1
 		fi
 
-		sig_state=$(strip_module_signature "${tmpdir}/snd-hda-codec-alc269.ko")
+		sig_state=$(strip_module_signature "${raw}")
 		if [[ "${sig_state}" == "stripped" ]]; then
 			install_reason='patched quirk and stripped stale module signature'
 		else
@@ -140,8 +198,8 @@ patch_kernel() {
 
 	backup="${module}.bak-um3405ga-$(date +%Y%m%d%H%M%S)"
 	cp -a "${module}" "${backup}"
-	zstd -q -19 -f "${tmpdir}/snd-hda-codec-alc269.ko" -o "${tmpdir}/snd-hda-codec-alc269.ko.zst"
-	install -m 0644 "${tmpdir}/snd-hda-codec-alc269.ko.zst" "${module}"
+	compress_module "${raw}" "${packed}"
+	install -m 0644 "${packed}" "${module}"
 
 	refresh_kernel_metadata "$kernel"
 
@@ -187,17 +245,18 @@ install_rebind_service() {
 
 	install -m 0755 "${rebind_src}" "${rebind_dst}"
 
+	# No ConditionPathExists here: the codec is often not registered yet when the
+	# unit starts, and a failed condition skips the unit outright instead of
+	# letting it wait. The helper does the waiting itself.
 	cat >"${service_file}" <<EOF
 [Unit]
 Description=Bind UM3405GA ALC294 codec to Realtek HDA driver
 After=systemd-udev-settle.service systemd-modules-load.service
 Wants=systemd-udev-settle.service
-ConditionPathExists=/sys/bus/hdaudio/devices/hdaudioC1D0
 
 [Service]
 Type=oneshot
-ExecStartPre=/bin/sh -c 'for i in \$(seq 1 50); do [ -e /sys/bus/hdaudio/devices/hdaudioC1D0 ] && exit 0; sleep 0.1; done; exit 1'
-ExecStart=${rebind_dst}
+ExecStart=${rebind_dst} --wait
 RemainAfterExit=yes
 
 [Install]
@@ -224,8 +283,5 @@ done
 
 printf '\nDone. Reboot, then check:\n'
 printf '  uname -r\n'
+printf '  ./check-um3405ga-sound.sh\n'
 printf '  systemctl status um3405ga-sound-rebind.service --no-pager\n'
-printf '  readlink -f /sys/bus/hdaudio/devices/hdaudioC1D0/driver\n'
-printf '  journalctl -k -b | grep -Ei "UM3405|cs35l41|CSC3551|ALC294"\n'
-printf '  modprobe snd_hda_codec_alc269\n'
-printf '  speaker-test -Dhw:1,0 -c2 -t wav\n'
