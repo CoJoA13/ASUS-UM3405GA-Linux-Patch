@@ -9,8 +9,8 @@ set -euo pipefail
 # (104319f4) coefficient files. The CS35L41 HDA driver only requests
 # board-specific .bin coefficients after a board-specific .wmfw matches, so both
 # filenames have to exist before the borrowed tuning is used. linux-firmware
-# ships no board-specific WMFW for the donor either, so the generic
-# cs35l41-dsp1-spk-prot.wmfw is what gets aliased.
+# ships one real WMFW under several names, so either the generic
+# cs35l41-dsp1-spk-prot.wmfw or the donor's own is what gets aliased.
 #
 # Which names the driver asks for depends on the speaker-ID GPIO it reads at
 # probe time, so the requested IDs are taken from the kernel log when possible.
@@ -21,6 +21,7 @@ target_ssid=${TARGET_SSID:-}
 target_spkid=${TARGET_SPKID:-}
 donor_spkid=${DONOR_SPKID:-}
 fallback_ssid=104319f4
+reload=${RELOAD:-0}
 amps=(l0 r0)
 stamp=$(date +%Y%m%d%H%M%S)
 
@@ -36,6 +37,7 @@ Environment overrides:
   DONOR_SPKID=<n>        (default: the donor file matching the target speaker ID)
   TARGET_SSID=<hex>      (default: read from the kernel log, else ${fallback_ssid})
   TARGET_SPKID=<n|none>  (default: read from the kernel log, else every variant)
+  RELOAD=1               (reload the DSP live instead of asking for a reboot)
   CARD=<alsa card number>
 EOF
 }
@@ -160,6 +162,22 @@ install_alias() {
 	printf 'Installed %s:\n  %s -> %s\n' "${label}" "${src}" "${dst}"
 }
 
+# An alias whose name differs only in case cannot be requested by anything, so
+# it is dead weight that also makes the firmware listing look installed. These
+# are files this script created, and they are renamed rather than deleted.
+disable_wrong_case() {
+	local file base prefix="cs35l41-dsp1-spk-prot-${target_ssid}"
+
+	while read -r file; do
+		base=${file##*/}
+		[[ "${base:0:${#prefix}}" == "${prefix}" ]] && continue
+		mv "${file}" "${file}.disabled-um3405ga-${stamp}"
+		printf 'Disabled an alias the driver can never request (wrong case):\n  %s\n' "${file}"
+	done < <(find "${firmware_dir}" -maxdepth 1 \
+		-iname "${prefix}-*" \
+		! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' | sort)
+}
+
 install_variant() {
 	local spkid=$1
 	local amp donor coeff_src wmfw_src coeff_dst wmfw_dst suffix
@@ -169,8 +187,15 @@ install_variant() {
 		exit 1
 	}
 
-	wmfw_src=$(resolve_file "${firmware_dir}/cs35l41-dsp1-spk-prot.wmfw") || {
-		printf 'Missing generic WMFW: %s/cs35l41-dsp1-spk-prot.wmfw\n' "${firmware_dir}" >&2
+	# linux-firmware ships one real WMFW and gives it a name per board, so a
+	# release may carry cs35l41-dsp1-spk-prot-<ssid>.wmfw without the bare
+	# generic name. The donor's own WMFW is that same firmware, so take it when
+	# the generic name is absent rather than refusing to install at all.
+	wmfw_src=$(resolve_file "${firmware_dir}/cs35l41-dsp1-spk-prot.wmfw") ||
+		wmfw_src=$(resolve_file "${firmware_dir}/cs35l41-dsp1-spk-prot-${donor_ssid}.wmfw") || {
+		printf 'No WMFW to alias: neither %s/cs35l41-dsp1-spk-prot.wmfw nor the %s variant exists.\n' \
+			"${firmware_dir}" "${donor_ssid}" >&2
+		printf 'Install the linux-firmware package that ships cirrus/cs35l41-dsp1-spk-prot*.wmfw.\n' >&2
 		exit 1
 	}
 
@@ -201,7 +226,7 @@ restore_target() {
 		mv "${file}" "${disabled}"
 		printf 'Disabled:\n  %s\n' "${disabled}"
 	done < <(find "${firmware_dir}" -maxdepth 1 \
-		-name "cs35l41-dsp1-spk-prot-${target_ssid}-*" \
+		-iname "cs35l41-dsp1-spk-prot-${target_ssid}-*" \
 		! -name '*.bak-um3405ga-*' ! -name '*.disabled-um3405ga-*' | sort)
 
 	if [[ "${found}" == "0" ]]; then
@@ -279,6 +304,14 @@ else
 	target_ssid=${target_ssid:-${fallback_ssid}}
 fi
 
+# cs35l41_request_firmware_file() lowercases the whole filename before asking
+# for it, but the kernel log prints the SSID upper case ("SSID: 104319F4").
+# Passing the logged spelling through installs 104319F4 aliases that nothing
+# will ever request: the files are present, the driver still falls back to the
+# generic firmware, and the speaker stays quiet with no error anywhere.
+target_ssid=${target_ssid,,}
+donor_ssid=${donor_ssid,,}
+
 declare -a variants=()
 if [[ -n "${target_spkid}" ]]; then
 	variants=("${target_spkid}")
@@ -292,6 +325,7 @@ fi
 
 case "${action}" in
 	install)
+		disable_wrong_case
 		for variant in "${variants[@]}"; do
 			install_variant "${variant}"
 		done
@@ -301,10 +335,17 @@ case "${action}" in
 		;;
 esac
 
-if card=$(find_alc294_card); then
-	reload_firmware "${card}" || true
+# Toggling DSP firmware load at runtime pokes the amps over I2C while the audio
+# stack is live. A reboot applies the same files with none of that risk, so the
+# live reload is opt-in.
+if [[ "${reload}" == "1" ]]; then
+	if card=$(find_alc294_card); then
+		reload_firmware "${card}" || true
+	else
+		printf 'Could not auto-detect the UM3405GA ALC294 ALSA card; reboot to load the tuning.\n'
+	fi
 else
-	printf 'Could not auto-detect the UM3405GA ALC294 ALSA card; reboot to load the tuning.\n'
+	printf '\nReboot to load the tuning (or re-run with RELOAD=1 to reload the DSP now).\n'
 fi
 
 printf '\nStart at a low volume, then check the CS35L41 firmware log with:\n'

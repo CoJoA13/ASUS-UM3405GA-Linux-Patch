@@ -14,7 +14,7 @@ The quirk landed in the **Linux 7.2 merge window**: it is in `v7.2-rc1` and
 newer, and it is **not** in any `7.1.x` stable release. A `7.1.x` kernel still
 needs the legacy module patch below.
 
-Start by asking the machine what it has:
+Start by asking the machine what it has. From a terminal:
 
 ```bash
 ./check-um3405ga-sound.sh
@@ -23,6 +23,12 @@ Start by asking the machine what it has:
 That reports the running kernel, whether its Realtek quirk table actually
 contains `1043:19f4`, which driver claimed the codec, what the CS35L41 amps
 bound as, and which tuning files are installed.
+
+Every run also writes the same report to `um3405ga-sound-report.txt` (in the
+current directory, or your home directory if that is not writable), so you can
+read it afterwards or paste it somewhere. Double-clicking the script from a file
+manager works too — it holds the window open until you press Enter instead of
+closing the instant it finishes.
 
 ## Preferred fix: a mainline kernel with the quirk
 
@@ -112,9 +118,17 @@ not available it installs every variant the donor provides, so whichever name
 the driver requests is there. Override with `TARGET_SSID`, `TARGET_SPKID`
 (a number or `none`) and `DONOR_SPKID` if needed.
 
-If the live reload does not complete, reboot before testing volume. **Start at a
-low volume after installing borrowed speaker tuning** — these coefficients
-describe someone else's speakers.
+**Reboot before testing the volume.** Installing the files does not change what
+the running DSP already loaded, so nothing sounds different until the amps
+re-request their firmware at boot. `RELOAD=1` reloads the DSP in place instead,
+but that toggles the amps over I2C while the audio stack is live, which is not
+worth the risk when a reboot does the same job.
+
+**Start at a low volume after installing borrowed speaker tuning** — these
+coefficients describe someone else's speakers.
+
+To check whether the tuning actually applied, run `./check-um3405ga-sound.sh`
+after rebooting: coefficient blocks the DSP rejects are reported there.
 
 To go back to the generic fallback tuning:
 
