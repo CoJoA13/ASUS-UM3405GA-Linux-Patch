@@ -308,27 +308,51 @@ run_report() {
 		# Matched in-shell rather than through `| grep -q`: grep exits on the
 		# first hit, the writer takes SIGPIPE, and pipefail then reports 141 for a
 		# pipeline that did match, silently dropping these findings.
-		# Each amp logs its own outcome, and they can differ: one speaker can load
-		# board tuning while the other falls back. Track the latest state per
-		# device so a working amp cannot mask a fallen-back one, and so a reload
-		# supersedes that device's earlier attempt.
+		# Track each amp separately: they can end up in different states, and one
+		# working amp must not mask one that fell back.
+		#
+		# State is the outcome of a whole load attempt, not the last marker seen.
+		# cs35l41_fallback_firmware_file() warns "Falling back to default
+		# firmware", then loads the generic firmware and the same path logs
+		# "Firmware Loaded" on success -- so both lines appear for a fallen-back
+		# amp, and reading only the last one would call generic firmware a win. A
+		# later "Firmware Loaded" with no fallback before it is a genuine reload.
 		declare -A amp_state=()
-		amp_state_re='cs35l41-hda ([^ ]+): (Falling back|Firmware Loaded)'
+		declare -A amp_pending=()
+		amp_marker_re='cs35l41-hda ([^ ]+): (Falling back to default firmware|Firmware Loaded|Unable to find firmware|Cannot Run Firmware|Bypassing Firmware)'
 		while IFS= read -r line; do
-			if [[ "${line}" =~ ${amp_state_re} ]]; then
-				amp_state["${BASH_REMATCH[1]}"]=${BASH_REMATCH[2]}
-			fi
+			[[ "${line}" =~ ${amp_marker_re} ]] || continue
+			amp_dev=${BASH_REMATCH[1]}
+			case "${BASH_REMATCH[2]}" in
+				'Falling back to default firmware')
+					amp_pending["${amp_dev}"]=fallback
+					amp_state["${amp_dev}"]=fallback
+					;;
+				'Firmware Loaded')
+					if [[ "${amp_pending[${amp_dev}]:-}" == "fallback" ]]; then
+						amp_state["${amp_dev}"]=fallback
+					else
+						amp_state["${amp_dev}"]=loaded
+					fi
+					amp_pending["${amp_dev}"]=''
+					;;
+				*)
+					amp_state["${amp_dev}"]=failed
+					amp_pending["${amp_dev}"]=''
+					;;
+			esac
 		done < <(printf '%s\n' "${klog}" |
-			grep -E 'Falling back to default firmware|Firmware Loaded')
+			grep -E 'Falling back to default firmware|Firmware Loaded|Unable to find firmware|Cannot Run Firmware|Bypassing Firmware')
 
 		fallback_amps=''
 		loaded_amps=''
+		failed_amps=''
 		for amp_dev in "${!amp_state[@]}"; do
-			if [[ "${amp_state[${amp_dev}]}" == "Falling back" ]]; then
-				fallback_amps+=" ${amp_dev}"
-			else
-				loaded_amps+=" ${amp_dev}"
-			fi
+			case "${amp_state[${amp_dev}]}" in
+				fallback) fallback_amps+=" ${amp_dev}" ;;
+				loaded) loaded_amps+=" ${amp_dev}" ;;
+				*) failed_amps+=" ${amp_dev}" ;;
+			esac
 		done
 
 		if [[ -n "${loaded_amps}" ]]; then
@@ -337,6 +361,10 @@ run_report() {
 		if [[ -n "${fallback_amps}" ]]; then
 			printf 'DSP firmware: generic fallback in use on:%s\n' "${fallback_amps}"
 			note 'At least one CS35L41 amp fell back to generic firmware; that speaker will be quiet'
+		fi
+		if [[ -n "${failed_amps}" ]]; then
+			printf 'DSP firmware: did not start on:%s\n' "${failed_amps}"
+			note 'At least one CS35L41 amp could not run its DSP firmware (see the log lines below)'
 		fi
 
 		# Coefficient blocks are matched to the algorithms in the loaded .wmfw.
